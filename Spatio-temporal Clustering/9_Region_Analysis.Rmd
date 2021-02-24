@@ -1,0 +1,640 @@
+---
+title: "3.7: Analysis of Weather Regions"
+author: "Silvia Ventoruzzo"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Import packages
+```{r}
+# Detach the following packages and ClustGeo
+if ("package:raster" %in% search()) detach("package:raster", unload=TRUE)
+if ("package:spacetime" %in% search()) detach("package:spacetime", unload=TRUE)
+if ("package:sp" %in% search()) detach("package:sp", unload=TRUE)
+if ("package:lattice" %in% search()) detach("package:lattice", unload=TRUE)
+if ("package:maps" %in% search()) detach("package:maps", unload=TRUE)
+
+cran_packages <- c("tidyselect", "tidyverse", "cluster", "ggdendro", "lubridate", "factoextra", 
+                   "ggpubr",  "corrplot", "BBmisc", "clValid", "ClustGeo",
+                   "gridExtra", "grid", "GGally", "ggforce", "gtools", "viridis")
+for (package in cran_packages) {
+  if(!require(package, character.only = TRUE)) install.packages(package, character.only = TRUE)
+  library(package, character.only = TRUE, quietly = TRUE)
+}
+
+rm(cran_packages)
+rm(package)
+```
+
+Load data from previous script
+```{r}
+load("../RData/8_Cluster_Methods_comparison.RData")
+```
+
+Set default ggplot theme
+```{r}
+theme_set(theme_bw())
+theme_update(plot.title = element_text(hjust = 0.5))
+theme_update(plot.subtitle = element_text(hjust = 0.5))
+```
+
+
+## Analysis of clusters
+
+### Definition of cluster centroids
+To improve speed in a future automatization, we will choose as centroid the weather station which has the lowest distance to the cluster center, i.e. the time series of daily means.
+
+```{r}
+apply(weather_data_norm, 2, function(x) sum(is.na(x))/length(x))
+```
+
+
+```{r}
+# Cluster centers
+cluster_centers <- weather_data_norm %>%
+  group_by(cluster, measurement_date) %>%
+  summarize_if(is.numeric, mean) %>%
+  ungroup() %>%
+  mutate(station_id = "center")
+# Station closest to respective cluster center
+# Out of those which did not have missing values in the numeric variables of interest
+nearest_to_center <- 
+  sapply(unique(station_data$cluster),
+         function(j) {
+           center <- cluster_centers %>% 
+             filter(cluster == j) %>% 
+             dplyr::select(-cluster)
+           # Stations which did not have missing values in the numeric variables of interest
+           points <- weather_data %>%
+             filter(cluster == j) %>%
+             group_by(station_id) %>%
+             summarize_at(vars(paste0(weather_variables, "_missing")), sum) %>%
+             filter_at(vars(paste0(weather_variables, "_missing")), function(x) x == 0) %>%
+             pull(station_id)
+           points <- c(points, "center")
+           # Matrices of station data and centers
+           data <- 
+              sapply(points,
+                     function(i) {
+                       weather_data_norm %>%
+                         bind_rows(center) %>%
+                         dplyr::filter(station_id == i) %>%
+                         pivot_longer(cols = all_of(numeric_variables), names_to = "variable") %>%
+                         pivot_wider(names_from = "measurement_date", 
+                                   values_from = "value") %>%
+                         dplyr::select(-station_id, -variable, -cluster) %>%
+                         as.matrix()
+                     },
+                   simplify = FALSE, USE.NAMES = TRUE)
+           # Calculate distance
+           distance <- parDist(x = data, method = "euclidean")
+           distance <- as.matrix(distance)
+           rownames(distance) <- points
+           colnames(distance) <- points
+           # Extract point with lowest distance
+           nearest_point <- apply(distance, 2, 
+                                  function(x) {
+                                    x <- x[x > 0]
+                                    return(data.frame(nearest = which.min(x),
+                                                      distance = min(x),
+                                                      stringsAsFactors = FALSE))
+                                  })
+           return(data.frame(nearest_point = points[nearest_point[["center"]]$nearest],
+                             distance = nearest_point[["center"]]$distance,
+                             stringsAsFactors = FALSE))
+         },
+         simplify = FALSE, USE.NAMES = TRUE) %>%
+  bind_rows() %>%
+  rownames_to_column(var = "cluster") %>%
+  mutate(cluster_center = as.integer(cluster))
+
+# Assignment of clusters and centroid info
+station_data <- station_data %>%
+  left_join(nearest_to_center[c("nearest_point", "cluster_center")], by = c("station_id" = "nearest_point"))
+station_points <- station_points %>%
+  left_join(nearest_to_center[c("nearest_point", "cluster_center")], by = c("station_id" = "nearest_point"))
+station_polygons <- station_polygons %>%
+  left_join(nearest_to_center[c("nearest_point", "cluster_center")], by = c("station_id" = "nearest_point"))
+weather_data <- weather_data %>%
+  left_join(station_data[c("station_id", "cluster_center")], by = "station_id")
+weather_data_num <- weather_data_num %>%
+  left_join(station_data[c("station_id", "cluster_center")], by = "station_id")
+weather_data_norm <- weather_data_norm %>%
+  left_join(station_data[c("station_id", "cluster_center")], by = "station_id")
+         
+# Map of clusters with centroids
+station_data %>%
+  drop_na(cluster_center) %>%
+  ggplot(aes(fill = as.character(cluster))) +
+  geom_sf(data = station_polygons, mapping = aes(geometry = polygon), 
+          alpha = 0.6, size = 0.3) +
+  geom_point(aes(x = lon, y = lat), size = 2) +
+  geom_label(aes(x = lon, y = lat+0.3, label = station_name), size = 3, color = "white") +
+  scale_fill_manual(values = plasma(n = length(unique(station_data$cluster_center)))) +
+  theme_void() +
+  labs(title = "Map of regions with respective centroid",
+       fill = "Region") +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+
+Centroid names
+```{r}
+station_data %>%
+  drop_na()
+```
+
+### Cluster plausibility
+\textbf{Cluster cardinality}: Cluster cardinality is the number of examples per cluster. Plot the cluster cardinality for all clusters and investigate clusters that are major outliers.
+\textbf{Cluster magnitude}: Cluster magnitude is the sum of distances from all examples to the centroid of the cluster. Similar to cardinality, check how the magnitude varies across the clusters, and investigate anomalies.
+\textbf{Magnitude vs. Cardinality}: Notice that a higher cluster cardinality tends to result in a higher cluster magnitude, which intuitively makes sense. Clusters are anomalous when cardinality doesn't correlate with magnitude relative to the other clusters. Find anomalous clusters by plotting magnitude against cardinality.
+```{r}
+# Cluster cardinality
+ggplot(data = station_data, aes(x = cluster)) +
+  geom_bar(fill = "steelblue") +
+  theme_bw() +
+  labs(title = "Cluster cardinality",
+       x = "cluster",
+       y = "Points in cluster") +
+    theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+
+# Cluster magnitude
+distance_to_centroids <- lapply(
+  unique(station_data$cluster),
+  function(i) {
+    centroid <- station_data %>%
+      filter(cluster_center == i) %>%
+      pull(station_id)
+    points <- station_data %>%
+      filter(cluster == i) %>%
+      pull(station_id)
+    data <- sapply(points,
+                   function(k) {
+                     weather_data_norm %>%
+                       filter(station_id == k) %>%
+                       pivot_longer(cols = all_of(numeric_variables), names_to = "variable") %>%
+                       pivot_wider(id_cols = c("station_id", "variable"),
+                                   names_from = "measurement_date", values_from = "value") %>%
+                       dplyr::select(-station_id, -variable) %>%
+                       as.matrix()
+                     },
+                   simplify = FALSE, USE.NAMES = TRUE)
+    # Calculate distance
+    distance <- parDist(x = data, method = "euclidean")
+    distance <- as.matrix(distance)
+    rownames(distance) <- points
+    colnames(distance) <- points
+    return(sum(distance[centroid,]))
+  }) %>%
+  set_names(nm = unique(station_data$cluster)) %>%
+  bind_rows() %>%
+  pivot_longer(cols = everything(), names_to = "cluster", values_to = "distance") %>%
+  mutate(cluster = as.integer(cluster))
+
+ggplot(data = distance_to_centroids, aes(x = cluster)) +
+  geom_bar(aes(y = distance), stat = "identity", fill = "steelblue") +
+  labs(title = "Cluster Magnitude",
+       x = "cluster",
+       y = "Total Point-to-Centroid Distance")
+
+# Magnitude vs. Cardinality
+station_data %>%
+  group_by(cluster) %>%
+  dplyr::count() %>%
+  full_join(distance_to_centroids, by = "cluster") %>%
+  ggplot(aes(x = n, y = distance)) +
+  geom_point(color = "steelblue") +
+  geom_smooth(method = lm) +
+  geom_text(aes(label = cluster), hjust = 0, vjust = -1) +
+  labs(title = "Cardinality vs Magnitude",
+       x = "cardinality",
+       y = "magnitude")
+```
+
+Calculate area size to check that it's not that different despite lower amount of points in cluster 4.
+```{r}
+cluster_polygons <- station_polygons %>%
+  st_set_precision(1e4) %>%
+  st_make_valid() %>%
+  st_buffer(0.0) %>%
+  group_by(cluster) %>%
+  summarize(do_union = TRUE) %>%
+  ungroup()
+
+cluster_polygons %>%
+  mutate(area = st_area(.) %>% units::set_units(value = "km^2")) 
+```
+
+Plot cardinality vs area
+```{r}
+cardinality <- station_data %>%
+  group_by(cluster) %>%
+  dplyr::count()
+
+cluster_polygons %>%
+  mutate(area = st_area(.) %>% units::set_units(value = "km^2")) %>%
+  left_join(cardinality, by = "cluster") %>%
+  ggplot(aes(x = n, y = area)) +
+  geom_point(color = "steelblue") +
+  geom_smooth(method = lm) +
+  geom_text(aes(label = cluster), hjust = 0, vjust = -1) +
+  theme_bw() +
+  labs(title = "Cardinality vs Area",
+       x = "cardinality",
+       y = "area") +
+    theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+
+rm(cardinality)
+```
+
+### Plots
+
+Time series of clusters
+```{r}
+weather_data %>%
+  filter(year(measurement_date) == 2015) %>%
+  mutate(cluster_center = ifelse(is.na(cluster_center), "point", "center"),
+         cluster = paste0("cluster ", cluster)) %>%
+  pivot_longer(cols = all_of(weather_variables), names_to = "variable") %>%
+  ggplot() +
+  geom_line(aes(x = measurement_date, y = value, alpha = cluster_center, color = cluster_center)) +
+  facet_grid(variable~cluster, scales = "free_y") +
+  theme_bw() +
+  labs(color = "", alpha = "") +
+  scale_alpha_discrete(range = c(1, 0.5)) +
+  scale_color_manual(values = c("red", "grey")) +
+  scale_x_date(date_breaks = "3 months",
+               date_labels = "%b") +
+  theme(legend.position = "bottom") +
+  labs(title = "Time series of points and centroids",
+       subtitle = "(Year 2015)",
+       x = "") +
+  theme(plot.title = element_text(hjust = 0.5, size = 12),
+        plot.subtitle = element_text(hjust = 0.5, size = 10),
+        legend.margin = margin(0,0,0,0),
+        legend.box.margin = margin(-10,-10,-10,-10))
+
+# One for each variable
+for (v in weather_variables) {
+  p <- weather_data %>%
+  filter(year(measurement_date) == 2015) %>%
+  mutate(cluster_center = ifelse(is.na(cluster_center), "point", "center"),
+         cluster = paste0("cluster ", cluster)) %>%
+  ggplot() +
+  geom_line(aes(x = measurement_date, y = !!sym(v), alpha = cluster_center, color = cluster_center)) +
+  facet_wrap(~cluster) +
+  theme_bw() +
+  labs(color = "", alpha = "") +
+  scale_alpha_discrete(range = c(1, 0.5)) +
+  scale_color_manual(values = c("red", "grey")) +
+  scale_x_date(date_breaks = "3 months",
+               date_labels = "%b") +
+  theme(legend.position = "bottom") +
+  labs(title = paste0("Time series of points and centroids of variable ", v),
+       subtitle = "(Year 2015)",
+       x = "") +
+  theme(plot.title = element_text(hjust = 0.5, size = 12),
+        plot.subtitle = element_text(hjust = 0.5, size = 10),
+        legend.margin = margin(0,0,0,0),
+        legend.box.margin = margin(-10,-10,-10,-10))
+  print(p)
+}
+```
+
+## Keep only centroids
+
+Create table with postal_code + cluster + cluster centroid
+```{r}
+station_and_centroids <-station_data %>%
+  left_join(drop_na(station_data, cluster_center), by = "cluster", suffix = c("", "_centroid")) %>%
+  dplyr::select(station_id, cluster, station_id_centroid)
+
+postal_codes_nn <- postal_codes_nn %>%
+  dplyr::select(-distance_km) %>%
+  left_join(station_and_centroids, by = "station_id")
+
+rm(station_and_centroids)
+```
+
+Weather data for centroids
+```{r}
+weather_data_centroids <- weather_data %>%
+  drop_na(cluster_center) %>%
+  dplyr::select(cluster, cluster_center, station_id, measurement_date, 
+                all_of(variables_of_interest), 
+                all_of(paste0(variables_of_interest, "_missing")),
+                all_of(paste0(weather_variables, "_score")),
+                weather_index)
+
+# Check that there is no date missing for any cluster centroid
+weather_data_centroids %>%
+  group_by(cluster, station_id) %>%
+  dplyr::count()
+weather_data_centroids %>%
+  group_by(cluster, station_id) %>%
+  summarize(n_distinct = n_distinct(measurement_date))
+```
+
+### Plots
+
+Boxplots of monthly weather
+```{r}
+# Boxplot of monthly weather by month
+for (m in unique(month(weather_data_centroids$measurement_date, label = TRUE, abbr = FALSE))) {
+  p <- weather_data_centroids %>%
+    filter(month(measurement_date, label = TRUE, abbr = FALSE) == m) %>%
+    pivot_longer(cols = weather_variables, names_to = "variable") %>%
+    ggplot(aes(x = as.character(cluster), y = value, fill = as.character(cluster))) +
+    geom_boxplot(alpha = 0.5) +
+    facet_wrap(~variable, scales = "free_y") +
+    scale_fill_manual(values = plasma(n = length(unique(station_data$cluster_center)))) +
+    labs(title = "Boxplots of weather variables across region points",
+         subtitle = paste0("Month = ", m),
+         x = "region") +
+      theme(axis.title.y = element_blank(),
+            legend.position = "none")
+  print(p)
+}
+
+# Boxplot of monthly weather by cluster
+for (c in unique(station_data$cluster)) {
+  p <- weather_data_centroids %>%
+    filter(cluster == c) %>%
+    mutate(month = month(measurement_date, label = TRUE, abbr = TRUE)) %>%
+    pivot_longer(cols = weather_variables, names_to = "variable") %>%
+    ggplot(aes(x = month, y = value, fill = month)) +
+    geom_boxplot(alpha = 0.5) +
+    scale_fill_manual(values = viridis(n = 12)) +
+    facet_wrap(~variable, scales = "free_y") +
+    labs(title = "Boxplots of weather variables across region points",
+         subtitle = paste0("Region = ", c),
+         x = "month") +
+      theme(axis.text.x = element_text(angle = 90, vjust = 0.5),
+            axis.title.y = element_blank(),
+            legend.position = "none")
+  print(p)
+}
+
+# Boxplot of monthly weather by variable
+for (v in weather_variables) {
+  p <- weather_data_centroids %>%
+    mutate(month = month(measurement_date, label = TRUE, abbr = FALSE)) %>%
+    ggplot(aes(x = as.character(cluster), y = !!sym(v), fill = as.character(cluster))) +
+    geom_boxplot(alpha = 0.5) +
+    facet_wrap(~month, scales = "free_y") +
+    labs(title = paste("Boxplots of monthly", v, "by region"),
+         x = "region") +
+      theme(axis.title.y = element_blank(),
+            legend.position = "none")
+  print(p)
+}
+
+# Boxplot of yearly weather
+weather_data_centroids %>%
+  pivot_longer(cols = weather_variables, names_to = "variable") %>%
+  ggplot(aes(x = as.character(cluster), y = value, fill = as.character(cluster))) +
+  geom_boxplot(alpha = 0.5) +
+  facet_wrap(~variable, scales = "free_y") +
+  scale_fill_manual(values = plasma(n = length(unique(station_data$cluster_center)))) +
+  labs(title = "Distribution of weather variables across region centroids",
+       subtitle = "yearly",
+       x = "region") +
+  theme(axis.title.y = element_blank(),
+        legend.position = "none")
+```
+
+
+Line plots
+```{r}
+# Of specific variable (weekly)
+for (v in weather_variables) {
+  p <- weather_data_centroids %>%
+    mutate(week = week(measurement_date)) %>%
+    group_by(cluster, week) %>%
+    summarize_at(vars(weather_variables), mean) %>%
+    ungroup() %>%
+    ggplot(aes(x = week, y = !!sym(v), color = as.character(cluster))) +
+    geom_line() +
+    scale_x_continuous(breaks = seq(0, 53, 10), minor_breaks = seq(0, 53, 5)) +
+    scale_color_manual(values = plasma(n = length(unique(station_data$cluster_center)))) +
+    labs(title = "Time series of weekly means across all years",
+         subtitle = paste("Variable:", v),
+         y = "weekly mean",
+         color = "Region") +
+    theme(legend.position = "bottom")
+  print(p)
+}
+
+# Of specific variable (monthly)
+for (v in weather_variables) {
+  p <- weather_data_centroids %>%
+    mutate(month = month(measurement_date, label = FALSE)) %>%
+    group_by(cluster, month) %>%
+    summarize_at(vars(weather_variables), mean) %>%
+    ungroup() %>%
+    ggplot(aes(x = month, y = !!sym(v), color = as.character(cluster))) +
+    geom_line() +
+    scale_x_continuous(breaks = seq(1, 12, 1)) +
+    scale_color_manual(values = plasma(n = length(unique(station_data$cluster_center)))) +
+    labs(title = "Time series of monthly means across all years",
+         subtitle = paste("Variable: ", v),
+         y = "monthly mean",
+         color = "Region") +
+    theme(legend.position = "bottom")
+  print(p)
+}
+```
+
+Comparison of weekly means/medians
+```{r}
+weather_data_centroids %>%
+  group_by(cluster, week = week(measurement_date)) %>%
+  summarize_at(vars(weather_variables), mean) %>%
+  ungroup() %>%
+  pivot_longer(cols = weather_variables, names_to = "variable") %>%
+  ggplot(aes(x = as.character(cluster), y = value)) +
+  geom_boxplot() +
+  facet_wrap(~variable, scales = "free_y") +
+  labs(title = "Boxplot of weekly means",
+       x = "cluster") +
+    theme(axis.title.y = element_blank())
+
+weather_data_centroids %>%
+  group_by(cluster, week = week(measurement_date)) %>%
+  summarize_at(vars(weather_variables), median) %>%
+  ungroup() %>%
+  pivot_longer(cols = weather_variables, names_to = "variable") %>%
+  ggplot(aes(x = as.character(cluster), y = value)) +
+  geom_boxplot() +
+  facet_wrap(~variable, scales = "free_y") +
+  theme_bw() +
+  labs(title = "Boxplot of weekly medians",
+       x = "cluster")  +
+    theme(axis.title.y = element_blank())
+```
+
+
+Plots of precipitation_type
+```{r}
+# Bar plot of yearly data
+weather_data_centroids %>%
+  mutate(cluster = paste0("region ", cluster)) %>%
+  ggplot(aes(x = precipitation_type)) +
+  geom_bar(aes(y = ..prop.., fill = factor(..x..), group = cluster), 
+           stat="count", color = "black",
+           alpha = 0.8) + 
+  facet_wrap(~cluster) +
+  scale_y_continuous(labels=scales::percent) +
+  labs(title = "Bar plot of precipitation type",
+       y = "proportion") +
+  theme(axis.title.x = element_blank(),
+        legend.position = "none") +
+  scale_fill_manual(values = cividis(n = length(unique(weather_data_centroids$precipitation_type))))
+
+# Month vs cluster
+weather_data_centroids %>%
+  mutate(cluster = paste0("region ", cluster)) %>%
+  group_by(cluster, month = month(measurement_date, label = TRUE), precipitation_type) %>%
+  dplyr::count() %>%
+  ungroup() %>%
+  group_by(cluster, month) %>%
+  mutate(tot = sum(n)) %>%
+  ungroup() %>%
+  mutate(percent = n/tot) %>%
+  ggplot(aes(x = precipitation_type, y = percent, fill = precipitation_type)) +
+  geom_bar(stat = "identity", color = "black", alpha = 0.8) +
+  facet_grid(cluster~month) +
+  labs(title = "Bar plot of precipitation type by month",
+       y = "proportion") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        axis.title.x = element_blank(),
+        axis.text = element_text(size = 8),
+        legend.position = "none") +
+  scale_y_continuous(labels=scales::percent) +
+  scale_fill_manual(values = cividis(n = length(unique(weather_data_centroids$precipitation_type))))
+```
+
+### Tables
+
+General information about clusters
+```{r}
+postal_code_inhabitants <- read_csv("../Data/inhabitants_information/plz_einwohner.csv")
+
+postal_code_inhabitants <- postal_code_inhabitants %>%
+  group_by(postal_code = str_sub(plz, 1, 3)) %>%
+  dplyr::summarize(inhabitants = sum(einwohner)) %>%
+  ungroup()
+
+postal_code_inhabitants %>%
+  full_join(postal_codes_nn, by = "postal_code") %>%
+  group_by(station_id) %>%
+  summarize(inhabitants = sum(inhabitants)) %>%
+  ungroup() %>%
+  full_join(station_polygons, by = "station_id") %>%
+  mutate(area = st_area(polygon) %>% units::set_units(value = "km^2")) %>%
+  group_by(cluster) %>%
+  dplyr::summarize(inhabitants = sum(inhabitants),
+                   area        = sum(area),
+                   cardinality = n()) %>%
+  ungroup()
+```
+
+
+Yearly descriptive statistics
+```{r}
+source("../Helpers/descriptive_statistics.R")
+# Numeric variables
+clusters_num <- weather_data_centroids %>%
+  group_by(cluster) %>%
+  group_map(~descr_numerical(.x))
+names(clusters_num)  <- as.character(1:4)
+clusters_num <- lapply(names(clusters_num),
+               function(i) {
+                 clusters_num[[i]] %>%
+                   mutate(cluster = i)
+               }) %>%
+  bind_rows() 
+
+# Categorical variables
+clusters_cat <- weather_data_centroids %>%
+  dplyr::select(-station_id) %>%
+  group_by(cluster) %>%
+  group_map(~descr_categorical(.x))
+names(clusters_cat)  <- as.character(1:4)
+clusters_cat <- lapply(names(clusters_cat),
+               function(i) {
+                 clusters_cat[[i]] %>%
+                   mutate(cluster = i)
+               }) %>%
+  bind_rows() 
+
+clusters_num %>%
+  dplyr::filter(variable %in% variables_of_interest) %>%
+  arrange(variable, cluster)
+clusters_cat %>%
+  dplyr::filter(variable %in% variables_of_interest) %>%
+  arrange(factor, cluster) 
+
+rm(list=lsf.str())
+```
+
+Monthly descriptive statistics
+```{r}
+source("../Helpers/descriptive_statistics.R")
+# Numeric variables
+clusters_monthly_num <- weather_data_centroids %>%
+  group_by(cluster, month = lubridate::month(x = measurement_date)) %>%
+  group_map(~descr_numerical(.x))
+names(clusters_monthly_num) <- expand.grid(cluster = 1:4, month = 1:12) %>%
+  mutate(names = paste0(cluster, ";", month)) %>%
+  pull(names)
+clusters_monthly_num <- lapply(names(clusters_monthly_num),
+               function(i) {
+                 clusters_monthly_num[[i]] %>%
+                   mutate(name = i) %>%
+                   separate(col = "name", into = c("cluster", "month"), remove = TRUE)
+               }) %>%
+  bind_rows() 
+
+# Categorical variables
+clusters_monthly_cat <- weather_data_centroids %>%
+  dplyr::select(-station_id) %>%
+  group_by(cluster, month = lubridate::month(x = measurement_date)) %>%
+  group_map(~descr_categorical(.x))
+names(clusters_monthly_cat) <- expand.grid(cluster = 1:4, month = 1:12) %>%
+  mutate(names = paste0(cluster, ";", month)) %>%
+  pull(names)
+clusters_monthly_cat <- lapply(names(clusters_monthly_cat),
+               function(i) {
+                 clusters_monthly_cat[[i]] %>%
+                   mutate(name = i) %>%
+                   separate(col = "name", into = c("cluster", "month"), remove = TRUE)
+               }) %>%
+  bind_rows() 
+
+clusters_monthly_num %>%
+  filter(variable %in% weather_variables) %>%
+  arrange(variable, month, cluster) 
+clusters_monthly_cat %>%
+  filter(variable %in% variables_of_interest) %>%
+  arrange(factor, month, cluster)
+
+rm(list=lsf.str())
+```
+
+Remove all except useful objects
+```{r}
+rm(list = str_subset(string = setdiff(ls(), c("cluster_polygons", "postal_codes_nn", 
+                                              "federal_state_polygons", "weather_data", 
+                                              "weather_data_centroids", "weather_variables",
+                                              "postal_code_polygons", "postal_code_inhabitants")),
+                     pattern = "^station",
+                     negate = TRUE))
+save.image("../RData/9_Weather_Regions.RData")
+```

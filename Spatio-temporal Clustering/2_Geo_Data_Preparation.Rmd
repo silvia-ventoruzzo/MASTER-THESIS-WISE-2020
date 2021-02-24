@@ -1,0 +1,625 @@
+---
+title: "2.2: Preparation of Geographical Data"
+author: "Silvia Ventoruzzo"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Import packages
+```{r}
+cran_packages <- c("tidyselect", "tidyverse", "sf", "lwgeom", "nngeo", "fastDummies",
+                  "lubridate", "factoextra", "ggpubr", "gridExtra", "grid", "xtable", "units", "ggforce")
+for (package in cran_packages) {
+  if(!require(package, character.only = TRUE)) install.packages(package, character.only = TRUE)
+  library(package, character.only = TRUE)
+}
+
+rm(cran_packages)
+rm(package)
+```
+
+Set default ggplot theme
+```{r}
+theme_set(theme_bw())
+theme_update(plot.title = element_text(hjust = 0.5))
+theme_update(plot.subtitle = element_text(hjust = 0.5))
+```
+
+
+Load data from previous script
+```{r}
+load("../RData/1_Weather_Station_Data.RData")
+```
+
+
+# Postal code polygons
+
+Load shapefile
+```{r}
+# https://www.suche-postleitzahl.org/downloads
+postal_code_polygons <- st_read(dsn = "../Data/german_postal_codes_shapefile/plz-gebiete.shp",
+                                 options = "ENCODING=UTF-8",
+                                 stringsAsFactors = FALSE, int64_as_string = TRUE)
+```
+
+Clean data
+* rename `plz` into `postal_code`
+* in column `note` separate postal code (first 6 characters, because of space) from the city name (rest)
+* merge polygons by first 3 digits of `postal_code` (to merge with order data)
+* Order dataframe by postal code
+```{r, warning=FALSE}
+postal_code_polygons <- postal_code_polygons %>%
+  separate(col = note, into = c("remove", "name"), sep = 6) %>%
+  st_make_valid() %>%
+  group_by(postal_code = str_sub(plz, 1, 3)) %>%
+  summarize(names = paste(unique(name), collapse = "; "),
+            do_union = TRUE) %>%
+  ungroup() %>%
+  st_cast("MULTIPOLYGON") %>%
+  rename(polygon = geometry) %>%
+  arrange(postal_code)
+```
+
+Areas of postal codes
+```{r}
+source("../Helpers/descriptive_statistics.R")
+
+# Histogram
+postal_code_polygons %>%
+  mutate(area = st_area(.) %>% set_units("km^2")) %>%
+  ggplot(aes(x = area, y = stat(count / sum(count)))) +
+  geom_histogram(bins = round(nrow(postal_code_polygons)/10, 0)) + 
+  scale_y_continuous(labels=scales::percent) +
+  theme_bw() +
+  labs(y = "proportion",
+       title = "Histogram of postal code areas") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Cumulative sum
+postal_code_polygons %>%
+  mutate(area = st_area(.) %>% set_units("km^2")) %>%
+  st_drop_geometry() %>%
+  group_by(area) %>%
+  dplyr::count() %>%
+  ungroup() %>%
+  arrange(area) %>%
+  mutate(percentage = n/sum(n),
+         percentage_cumsum = scales::percent(cumsum(percentage)))
+
+# Descriptive statistics
+postal_code_polygons %>%
+  mutate(area = st_area(.) %>% set_units("km^2"),
+         area = as.numeric(area)) %>%
+  st_drop_geometry() %>%
+  dplyr::select(area) %>%
+  descr_numerical() %>%
+  pivot_longer(cols = names(.)[names(.) != "variable"], names_to = "statistic") %>%
+  dplyr::select(-variable) %>%
+  xtable() %>%
+  print(include.rownames = FALSE)
+
+# Max and min
+postal_code_polygons %>%
+  mutate(area = st_area(.) %>% set_units("km^2")) %>%
+  # st_drop_geometry() %>%
+  # filter(area %in% c(min(area), max(area))) %>%
+  filter(area %in% c(min(area), max(area))) %>%
+  ggplot() +
+  geom_sf(data = postal_code_polygons) +
+  geom_sf(fill = "red", alpha = 0.5) +
+  theme_void()
+
+rm(list=lsf.str())
+```
+
+
+# Federal states polygons
+
+Load shapefile
+```{r}
+federal_state_polygons <- st_read(dsn = "../Data/german_federal_states_shapefile/vg2500/vg2500_lan.shp",
+                                   options = "ENCODING=UTF-8",
+                                   stringsAsFactors = FALSE, int64_as_string = TRUE)
+```
+
+Clean data
+* rename `GEN` into `federaL_state` and `geometry` into `federal_state_poylgon`
+* remove unneeded colums
+* order dataframe by federal state
+* reproject data (to have the projection longlat instead the tmerc)
+```{r}
+federal_state_polygons <- federal_state_polygons %>%
+  rename(federal_state = GEN,
+         federal_state_polygon = geometry) %>%
+  dplyr::select(-ADE, -RS, -RS_0) %>%
+  arrange(federal_state) %>%
+  st_transform(crs = st_crs(postal_code_polygons))
+```
+
+## Plots
+Check that data works correctly.
+
+```{r}
+postal_code_polygons <- postal_code_polygons %>%
+  st_remove_holes() %>%
+  rename(polygon = geom) %>%
+  st_cast("MULTIPOLYGON")
+
+postal_code_polygons %>%
+  ggplot() +
+  geom_sf() +
+  theme_void() +
+  labs(title = "Map of postal codes") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+federal_state_polygons %>%
+  ggplot() +
+  geom_sf() +
+  theme_void()
+
+ggplot() +
+  geom_sf(data = postal_code_polygons,
+          aes(geometry = polygon)) +
+  geom_sf(data = federal_state_polygons,
+          aes(geometry = federal_state_polygon), color = "red", fill = NA) +
+  theme_void() +
+  labs(title = "Map of postal codes",
+       subtitle = "with respect to Federal States") +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+Areas of postal codes
+```{r}
+source("../Helpers/descriptive_statistics.R")
+
+# Histogram
+postal_code_polygons %>%
+  mutate(area = st_area(.) %>% set_units("km^2")) %>%
+  ggplot(aes(x = area, y = stat(count / sum(count)))) +
+  geom_histogram(bins = round(nrow(postal_code_polygons)/10, 0)) + 
+  scale_y_continuous(labels=scales::percent) +
+  theme_bw() +
+  labs(y = "proportion",
+       title = "Histogram of postal code areas") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Cumulative sum
+postal_code_polygons %>%
+  mutate(area = st_area(.) %>% set_units("km^2")) %>%
+  st_drop_geometry() %>%
+  group_by(area) %>%
+  dplyr::count() %>%
+  ungroup() %>%
+  arrange(area) %>%
+  mutate(percentage = n/sum(n),
+         percentage_cumsum = scales::percent(cumsum(percentage)))
+
+# Descriptive statistics
+postal_code_polygons %>%
+  mutate(area = st_area(.) %>% set_units("km^2"),
+         area = as.numeric(area)) %>%
+  st_drop_geometry() %>%
+  dplyr::select(area) %>%
+  descr_numerical() %>%
+  pivot_longer(cols = names(.)[names(.) != "variable"], names_to = "statistic") %>%
+  dplyr::select(-variable) %>%
+  xtable() %>%
+  print(include.rownames = FALSE)
+
+# Max and min
+postal_code_polygons %>%
+  mutate(area = st_area(.) %>% set_units("km^2")) %>%
+  filter(area %in% c(min(area), max(area))) %>%
+  ggplot() +
+  geom_sf(data = federal_state_polygons) +
+  geom_sf(fill = "red", alpha = 0.5)
+
+rm(list=lsf.str())
+```
+
+
+# Weather station polygons
+We have the coordinates associated to the weather stations, but it would be useful for visualization and clustering to have the coverage area of the stations. This will be defined merging the polygons of those postal codes which are closest to that station.
+
+Steps:
+0. Transform weather station data
+1. Find station nearest neighbor for each postal code
+2. Join with `postal_codes_polygon` using `postal_code`
+3. Merge polygons by station
+
+### Transform weather station data
+Transform coordinates to point
+```{r}
+station_points <- st_as_sf(station_data, coords = c("lon", "lat"),
+                           crs = st_crs(postal_code_polygons), agr = "identity")
+```
+
+### Find station nearest neighbor for each postal code
+1-NN weather station for each postal code.
+```{r, warning=FALSE}
+source("../Helpers/st_nn_df.R")
+postal_codes_nn <- st_nn_df(x = postal_code_polygons,
+                            y = station_points,
+                            k = 1,
+                            x_names = postal_code_polygons$postal_code,
+                            y_names = station_points$station_id)
+rm(st_nn_df)
+```
+
+Clean dataframe
+* rename variables
+* remove extra string used so that in the functions there would be no column names which are numbers
+* transform distance from meters to km
+```{r}
+postal_codes_nn <- postal_codes_nn %>%
+  mutate(distance_km = round(distance_m_1/1000, 4)) %>%
+  rename(postal_code = x,
+         station_id = nn_1) %>%
+  dplyr::select(postal_code, station_id, distance_km)
+
+cat("Max distance between postal_code and station_id:",
+    max(postal_codes_nn$distance_km), 
+    "km\n")
+cat("Number of weather stations:",
+    length(unique(postal_codes_nn$station_id)))
+```
+
+From the initial 191 available stations, only 180 were the first nearest neighbors of at least one postal code. Let's examine which ones.
+```{r}
+lost_stations <- setdiff(station_data$station_id, unique(postal_codes_nn$station_id))
+
+station_data %>%
+  mutate(lost = ifelse(station_id %in% lost_stations, TRUE, FALSE)) %>%
+  ggplot() +
+  geom_point(aes(x = lon, y = lat, color = lost)) +
+  geom_sf(data = federal_state_polygons, fill = NA) +
+  theme_void()
+
+station_data <- station_data %>%
+  filter(!(station_id %in% lost_stations))
+
+station_points <- station_points %>%
+  filter(!(station_id %in% lost_stations))
+
+weather_data <- weather_data %>%
+  filter(!(station_id %in% lost_stations))
+
+rm(lost_stations)
+```
+
+Statistics about distances between postal codes and weather stations
+```{r}
+postal_codes_nn %>%
+  left_join(station_data[c("station_id", "station_name")], by = "station_id") %>%
+  arrange(station_id, postal_code) %>%
+  mutate(station_distance = paste0(postal_code, " (", sprintf("%.2f", round(distance_km, 2)), ")")) %>%
+  group_by(station_id) %>%
+  summarize(stations_nn = paste(station_distance, collapse = ", "),
+            stations_count = n()) %>%
+  ungroup() %>%
+  dplyr::select(station_id, stations_count, stations_nn)
+```
+
+Distance between postal codes and weather stations
+```{r}
+source("../Helpers/descriptive_statistics.R")
+# Descriptive statistics
+postal_codes_nn %>%
+  descr_numerical() %>%
+  pivot_longer(cols = names(.)[names(.) != "variable"], names_to = "statistic") 
+
+# Histogram
+postal_codes_nn %>%
+  ggplot(aes(x = distance_km, y = stat(width*density))) +
+  geom_histogram(bins = round(nrow(postal_codes_nn)/10, 0)) +
+  scale_y_continuous(labels=scales::percent) +
+  theme_bw() +
+  labs(x = "distance [km]",
+       y = "proportion",
+       title = "Histogram of distances between postal code and 1-NN weather station") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Outliers
+postal_codes_nn %>%
+  slice(which(postal_codes_nn$distance_km %in% boxplot(postal_codes_nn$distance_km, plot = FALSE)$out)) %>%
+  left_join(postal_code_polygons, by = "postal_code") %>%
+  ggplot(aes(geometry = polygon)) +
+  geom_sf(fill = "red") +
+  geom_sf(data = postal_code_polygons, fill = NA)
+
+rm(list=lsf.str())
+```
+
+
+### Join with `postal_codes_polygon` using `postal_code`
+Merge polygons by station
+```{r}
+station_polygons <- postal_code_polygons %>%
+  inner_join(postal_codes_nn, by = "postal_code") %>%
+  group_by(station_id) %>%
+  summarize(do_union = TRUE) %>%
+  ungroup() %>%
+  st_cast("MULTIPOLYGON")
+
+# Remove holes
+station_polygons <- station_polygons %>%
+  st_remove_holes() %>%
+  rename(polygon = geom) %>%
+  st_cast("MULTIPOLYGON")
+
+# Plot
+station_polygons %>%
+  ggplot() +
+  geom_sf(aes(geometry = polygon, fill = station_id), show.legend = FALSE) +
+  theme_void() +
+  labs(title = "Weather station areas",
+       subtitle = "Creating by merging the postal codes for which the station is the nearest one") +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+
+Remove holes between polygons (slivers)
+```{r, warning=FALSE}
+source("../Helpers/st_fill_slivers.R")
+
+station_polygons <- st_fill_slivers(sf_df       = station_polygons,
+                                    id_colname   = "station_id",
+                                    geom_colname = "polygon")
+
+rm(list=lsf.str())
+```
+
+Order data according to station_id, so that it has the same order as the other dataframe.
+```{r}
+station_data <- station_data %>%
+  arrange(station_id)
+station_points <- station_points %>%
+  arrange(station_id)
+station_polygons <- station_polygons %>%
+  arrange(station_id)
+weather_data <- weather_data %>%
+  arrange(station_id, measurement_date)
+```
+
+Map of weather stations
+```{r}
+ggplot(data = federal_state_polygons) +
+  geom_sf(color = "grey", fill = NA) +
+  geom_sf(data = station_points, color = "red") +
+  geom_sf_text(aes(label = federal_state), size = 3) +
+  theme_void() +
+  labs(title = "Map of weather stations",
+       subtitle = "with respect to federal states") +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+Count of weather stations pro Federal State
+```{r}
+station_states <- st_within(x = station_points, y = federal_state_polygons)
+station_states[lengths(station_states)==0] <- NA
+station_data %>%
+  mutate(federal_state = federal_state_polygons$federal_state[unlist(station_states)],
+         federal_state = ifelse(is.na(federal_state), "Mecklenburg-Vorpommern", federal_state)) %>%
+  group_by(federal_state) %>%
+  dplyr::count() %>%
+  ungroup() %>%
+  mutate(percentage = scales::percent(n/sum(n), accuracy = 0.01, suffix = " %")) %>%
+  arrange(desc(n))
+
+rm(station_states)
+```
+
+# Weather scores and weather index
+
+## Weather deciles
+The first step in calculating the weather scores is calculating the weather deciles for each weather station and month for the different years. This will be done taking the values of that weather variable for the previous 5 years and calculating the deciles for these.
+
+Create dataframe with weather data to calculate deciles and to save information afterwards.
+I had an extra variable to simplify the calculation of the deciles by year (for 2015, we use the years 2010-2014 and so on).
+
+```{r}
+source("../Helpers/weather_scores_helpers.R")
+
+# Years we will analyze
+reference_years <- 2015:2019
+
+# Year and month
+weather_data <- weather_data %>%
+  mutate(year = year(measurement_date),
+         month = month(measurement_date))
+# Dataframe to calculate deciles
+weather_data_before <- weather_data %>%
+  filter(year >= min(reference_years)-5,
+         year <= max(reference_years)-1) %>%
+  mutate_at(vars(year), funs(!!!reference_years_calculation(reference_years)))
+
+# Dataframe to apply deciles for analysis
+weather_data_reference <- weather_data %>%
+  filter(year >= min(reference_years),
+         year <= max(reference_years))
+
+rm(reference_years_calculation)
+```
+
+Calculate deciles grouped by weather station, year, month.
+```{r}
+quantiles <- seq(from = 0, to = 1, by = 0.1)
+  
+weather_deciles <- weather_data_before %>%
+  dplyr::select(-year) %>%
+  pivot_longer(cols = paste0("year_", reference_years), names_to = "year", values_to = "yesno") %>%
+  filter(yesno == TRUE) %>%
+  group_by(station_id, year, month) %>%
+  summarize_at(vars(weather_variables), funs(!!!grouped_quantiles(quantiles))) %>%
+  ungroup() %>%
+  mutate(year = as.numeric(gsub("year_", "", year)))
+
+rm(grouped_quantiles)
+rm(quantiles)
+```
+
+## Weather scores
+The weather scores are calculated with respect to the different deciles. They have a score between 1 and 10 (from 0 for `precipitation_mm`) and they are calculated such that if the daily value is under 10%-decile they get a 1, under 20%-decile they get a 2 and so on.
+
+```{r}
+# Create table with combinations: weather variable, station, year and month
+combinations <- expand.grid(weather_var = weather_variables,
+                            station     = unique(weather_deciles$station_id),
+                            year        = unique(weather_deciles$year),
+                            month       = unique(weather_deciles$month),
+                            stringsAsFactors = FALSE)
+
+# Find to which deciles the values belong
+data_list <- list()
+
+for (j in 1:nrow(combinations)) {
+
+  one_station <- combinations[j, "station"]
+  till_year   <- combinations[j, "year"]
+  one_month   <- combinations[j, "month"]
+  variable    <- combinations[j, "weather_var"]
+
+  one_deciles <- weather_deciles %>%
+    filter(station_id == one_station,
+           year    == till_year,
+           month   == one_month)
+
+  partial_weather <- weather_data_reference %>%
+    filter(station_id == one_station,
+           year       == till_year,
+           month      == one_month)
+
+  if (variable == "precipitation_mm") {
+
+   data_list[[variable]][[paste(one_station, till_year, one_month, sep = ";")]] <- partial_weather %>%
+      rename(y = !!variable) %>%
+      transmute(station_id = station_id,
+                measurement_date = measurement_date,
+                !!paste0(variable, "_", "score") := case_when(y <= one_deciles[[paste0(variable, "_0%")]] ~ 0,
+                                                              y <= one_deciles[[paste0(variable, "_10%")]] ~ 1,
+                                                              y <= one_deciles[[paste0(variable, "_20%")]] ~ 2,
+                                                              y <= one_deciles[[paste0(variable, "_30%")]] ~ 3,
+                                                              y <= one_deciles[[paste0(variable, "_40%")]] ~ 4,
+                                                              y <= one_deciles[[paste0(variable, "_50%")]] ~ 5,
+                                                              y <= one_deciles[[paste0(variable, "_60%")]] ~ 6,
+                                                              y <= one_deciles[[paste0(variable, "_70%")]] ~ 7,
+                                                              y <= one_deciles[[paste0(variable, "_80%")]] ~ 8,
+                                                              y <= one_deciles[[paste0(variable, "_90%")]] ~ 9,
+                                                              y > one_deciles[[paste0(variable, "_90%")]] ~ 10))
+
+  } else {
+
+   data_list[[variable]][[paste(one_station, till_year, one_month, sep = ";")]] <- partial_weather %>%
+      rename(y = !!variable) %>%
+      transmute(station_id = station_id,
+                measurement_date = measurement_date,
+                !!paste0(variable, "_", "score") := case_when(y <= one_deciles[[paste0(variable, "_10%")]] ~ 1,
+                                                              y <= one_deciles[[paste0(variable, "_20%")]] ~ 2,
+                                                              y <= one_deciles[[paste0(variable, "_30%")]] ~ 3,
+                                                              y <= one_deciles[[paste0(variable, "_40%")]] ~ 4,
+                                                              y <= one_deciles[[paste0(variable, "_50%")]] ~ 5,
+                                                              y <= one_deciles[[paste0(variable, "_60%")]] ~ 6,
+                                                              y <= one_deciles[[paste0(variable, "_70%")]] ~ 7,
+                                                              y <= one_deciles[[paste0(variable, "_80%")]] ~ 8,
+                                                              y <= one_deciles[[paste0(variable, "_90%")]] ~ 9,
+                                                              y > one_deciles[[paste0(variable, "_90%")]] ~ 10))
+  }
+}
+
+# Merge dataframes from list
+variable_scores <- lapply(data_list, function(x) bind_rows(x))
+weather_data_scores <- reduce(variable_scores, full_join, by = c("station_id", "measurement_date"))
+
+rm(combinations)
+rm(j)
+rm(one_deciles)
+rm(partial_weather)
+rm(one_month)
+rm(one_station)
+rm(till_year)
+rm(variable)
+rm(data_list)
+rm(variable_scores)
+rm(weather_data_before)
+```
+
+
+## Weather Index
+
+The Weather Index will be calculated as defined in the paper "The Value of Weather Information for E-Commerce Operations": $WI_t = temp^s_t + sun^s_t - precipitation^s_t$
+```{r}
+weather_data <- weather_data_reference %>%
+  left_join(weather_data_scores, by = c("station_id", "measurement_date")) %>%
+  mutate(weather_index = temperature_c_score + sunshine_h_score - precipitation_mm_score)
+head(weather_data)
+
+rm(weather_data_reference)
+rm(weather_data_scores)
+```
+
+Distribution of weather scores pro month
+```{r}
+p_score <- weather_data %>%
+  pivot_longer(cols = ends_with("score"), names_to = "variable") %>%
+  mutate(month = month(measurement_date, label = TRUE, abbr = FALSE),
+         variable = gsub("_score", "", variable)) %>%
+  group_by(month, variable, value) %>%
+  dplyr::count() %>%
+  ungroup() %>%
+  group_by(variable, month) %>%
+  mutate(percentage = n/sum(n)) %>%
+  ungroup() %>%
+  ggplot() +
+  geom_line(aes(x = value, y = percentage, color = month)) +
+  scale_y_continuous(labels=scales::percent) +
+  scale_color_manual(values = viridis(n = 12)) +
+  facet_wrap(~variable, nrow = 3, scales = "free_y", strip.position = "r") +
+  scale_x_continuous(breaks = seq(0, 10, 2)) +
+  theme(strip.text = element_text(size = 7.5)) +
+  labs(x = "weather score",
+       y = "proportion",
+       color = "Month",
+       subtitle = "Weather Scores")
+```
+
+
+Distribution of weather index pro month
+```{r}
+p_index <- weather_data %>%
+  mutate(month = month(measurement_date, label = TRUE, abbr = FALSE)) %>%
+  group_by(month, weather_index) %>%
+  dplyr::count() %>%
+  ungroup() %>%
+  group_by(month) %>%
+  mutate(percentage = n/sum(n)) %>%
+  ungroup() %>%
+  ggplot() +
+  geom_line(aes(x = weather_index, y = percentage, color = month)) +
+  scale_x_continuous(breaks = seq(-10, 20, 5)) +
+  scale_y_continuous(labels=scales::percent) +
+  scale_color_manual(values = viridis(n = 12)) +
+  labs(x = "weather index",
+       y = "proportion",
+       color = "Month",
+       subtitle = "Weather Index")
+```
+
+Merge plots
+```{r}
+p_weather <- ggpubr::ggarrange(p_score, p_index, ncol = 2, common.legend = TRUE, legend = "bottom")
+p_weather <- ggpubr::annotate_figure(p = p_weather, 
+                                     top = "Distribution of Weather Scores and Index across all stations")
+p_weather
+```
+
+
+```{r}
+rm(list = str_subset(string = ls(), pattern = "^p_"))
+save.image("../RData/2_Geo_Data.RData")
+```

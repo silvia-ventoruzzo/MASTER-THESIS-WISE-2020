@@ -1,0 +1,229 @@
+---
+title: "3.2: Clustering with method HiClimR"
+author: "Silvia Ventoruzzo"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Import packages
+```{r}
+cran_packages <- c("tidyselect", "tidyverse", "sf", "lwgeom", "nngeo", "fastDummies",
+                   "HiClimR", "cluster", "ggdendro", "lubridate", "parallelDist",
+                   "dtw", "factoextra", "ggpubr",  "corrplot", "BBmisc", "tseries",
+                   "dtwclust", "clValid", 
+                   "gridExtra", "grid", "GGally", "ggforce", "gtools", "viridis")
+for (package in cran_packages) {
+  if(!require(package, character.only = TRUE)) install.packages(package, character.only = TRUE)
+  library(package, character.only = TRUE, quietly = TRUE)
+}
+
+rm(cran_packages)
+rm(package)
+```
+
+Load data from previous script
+```{r}
+load("../RData/3_Data_for_Clustering.RData")
+```
+
+Set default ggplot theme
+```{r}
+theme_set(theme_bw())
+theme_update(plot.title = element_text(hjust = 0.5))
+theme_update(plot.subtitle = element_text(hjust = 0.5))
+```
+
+
+## HiClimR
+
+HiClimR requires a matrix, or a list of matrices, with N rows as spatial elements (here: stations) and M columns as observations (here: days) for each variable.
+
+Check that all matrices have the same size
+```{r}
+sapply(names(weather_matrix_list),
+       function(i) dim(weather_matrix_list[[i]]))
+```
+
+### method = "regional"
+Since the variable `station_height` is for most stations constant through time, it needs to be removed from the list, because the function `HiClimR` requires multiple values for each row (station).
+
+```{r}
+source("../Helpers/hclust_nclust.R")
+
+HiClimR_regional_results <- HiClimR(x           = weather_matrix_list,
+                                    method      = "regional",
+                                    lon         = station_data$lon,
+                                    lat         = station_data$lat,
+                                    validClimR  = TRUE,
+                                    plot        = FALSE)
+
+hclust_nclust(hclust_resu = HiClimR_regional_results,
+               feature_distance_matrix = corr_matrix,
+               spatial_distance_matrix = geodist_matrix,
+              colors = cividis(n = 2, end = 0.8))
+```
+
+The regional linkage method already gives a number of clusters. However, it is also possible to manually cut the tree. Looking at the results from the graphics displayed before, the chosen number of clusters is 6.
+```{r}
+ggplot(station_polygons) +
+  geom_sf(aes(fill=as.factor(HiClimR_regional_results$region)),
+          size = 0.3, alpha = 0.6) +
+  labs(title="Map of clusters from HiClimR",
+       subtitle = "detrended daily data, method = `regional`",
+       caption = paste0("Automatic cut at ", 
+                        length(HiClimR_regional_results$regionID), " clusters"),
+       fill="Region") +
+  scale_fill_manual(values = plasma(n = length(HiClimR_regional_results$regionID))) +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+
+k_HclimR_reg <- 6
+
+ggplot(station_polygons) +
+  geom_sf(aes(fill=as.factor(cutree(HiClimR_regional_results, k = k_HclimR_reg))),
+          size = 0.3, alpha = 0.6) +
+  labs(title="Map of clusters from HiClimR",
+       subtitle = "detrended daily data, method = `regional`",
+       paste0("Manual cut at ", k_HclimR_reg, " clusters"),
+       fill="Region") +
+  scale_fill_manual(values = plasma(n = k_HclimR_reg)) +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+Most of the stations are in Cluster 1, so we check which ones are in Cluster 2.
+```{r}
+station_data %>%
+  mutate(cluster = HiClimR_regional_results$region) %>%
+  filter(cluster == 2)
+```
+
+### method = "average", contigConst = 1
+
+An alternative to the newly developed regional linkage method is a "standard" linkage method with a contiguity constraint ([0-1]). Since the adjecency of stations is very important, the contiguity constraint will be set to 1.
+```{r}
+HiClimR_average_results <- HiClimR(x           = weather_matrix_list,
+                                method      = "average",
+                                contigConst = 1,
+                                lon         = station_data$lon,
+                                lat         = station_data$lat,
+                                validClimR  = TRUE,
+                                plot        = FALSE)
+hclust_nclust(hclust_result = HiClimR_average_results,
+               feature_distance_matrix = corr_matrix,
+               spatial_distance_matrix = geodist_matrix,
+              colors = cividis(n = 2, end = 0.8))
+
+rm(weather_matrix_list)
+```
+
+Map of clusters
+```{r}
+k_HclimR_avg <- 4
+ggplot(station_polygons) +
+  geom_sf(aes(fill=as.factor(cutree(HiClimR_average_results, k = k_HclimR_avg))),
+          size = 0.3, alpha = 0.6) +
+  labs(title="Map of clusters from HiClimR",
+       subtitle = "detrended daily data, method = `average` and contigConst = 1",
+       fill="Region") +
+  scale_fill_manual(values = plasma(n = k_HclimR_avg)) +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+## With weekly data
+
+### method = "regional"
+Since the variable `station_height` is for most stations constant through time, it needs to be removed from the list, because the function `HiClimR` requires multiple values for each row (station).
+
+```{r}
+HiClimR_regional_weekly_results <- HiClimR(x    = weather_weekly_matrix_list,
+                                    method      = "regional",
+                                    lon         = station_data$lon,
+                                    lat         = station_data$lat,
+                                    validClimR  = TRUE,
+                                    plot        = FALSE)
+
+hclust_nclust(hclust_result = HiClimR_regional_weekly_results,
+               feature_distance_matrix = corr_weekly_matrix,
+               spatial_distance_matrix = geodist_matrix,
+              colors = cividis(n = 2, end = 0.8))
+```
+
+As before, the regional linkage method produces its own cut, but looking at the graphics I also chose another value.
+```{r}
+ggplot(station_polygons) +
+  geom_sf(aes(fill=as.factor(HiClimR_regional_weekly_results$region)),
+          size = 0.3, alpha = 0.6) +
+  labs(title="Map of clusters from HiClimR",
+       subtitle = "weekly data, method = `regional`",
+       caption = paste0("Automatic cut at ", length(HiClimR_regional_weekly_results$regionID), " clusters"),
+       fill="Region") +
+    scale_fill_manual(values = plasma(n = length(HiClimR_regional_weekly_results$regionID))) +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+
+k_HclimR_week_reg <- 6
+ggplot(station_polygons) +
+  geom_sf(aes(fill=as.factor(cutree(HiClimR_regional_weekly_results, k = k_HclimR_week_reg))),
+          size = 0.3, alpha = 0.6) +
+  labs(title="Map of clusters from HiClimR",
+       subtitle = "weekly data, method = `regional`",
+       paste0("Manual cut at ", k_HclimR_week_reg, " clusters"),
+       fill="Region") +
+    scale_fill_manual(values = plasma(n = k_HclimR_week_reg)) +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+```{r}
+station_data %>%
+  mutate(cluster = HiClimR_regional_weekly_results$region) %>%
+  filter(cluster == 2)
+```
+
+### method = "average", contigConst = 1
+```{r}
+HiClimR_average_weekly_results <- HiClimR(x           = weather_weekly_matrix_list,
+                                method      = "average",
+                                contigConst = 1,
+                                lon         = station_data$lon,
+                                lat         = station_data$lat,
+                                validClimR  = TRUE,
+                                plot        = FALSE)
+hclust_nclust(hclust_result = HiClimR_average_weekly_results,
+               feature_distance_matrix = corr_weekly_matrix,
+               spatial_distance_matrix = geodist_matrix,
+              colors = cividis(n = 2, end = 0.8))
+
+rm(weather_weekly_matrix_list)
+```
+
+Map of clusters
+```{r}
+k_HclimR_week_avg <- 5
+ggplot(station_polygons) +
+  geom_sf(aes(fill=as.factor(cutree(HiClimR_average_weekly_results, k = k_HclimR_week_avg))),
+          size = 0.3, alpha = 0.6) +
+  labs(title="Map of clusters from HiClimR",
+       subtitle = "weekly data, method = `average` and contigConst = 1",
+       fill="Region") +
+  theme_void() +
+  scale_fill_manual(values = plasma(n = k_HclimR_week_avg)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+```{r}
+rm(list = str_subset(string = str_subset(string = ls(), pattern = "results$", negate = TRUE), 
+                     pattern = "^k_", negate = TRUE))
+save.image("../RData/4_HiClimR_results.RData")
+```

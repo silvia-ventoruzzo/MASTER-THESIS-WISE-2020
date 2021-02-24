@@ -1,0 +1,101 @@
+---
+title: "3.5: Clustering with method CorClustST"
+author: "Silvia Ventoruzzo"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Import packages
+```{r}
+# Detach the following packages and ClustGeo
+if ("package:raster" %in% search()) detach("package:raster", unload=TRUE)
+if ("package:spacetime" %in% search()) detach("package:spacetime", unload=TRUE)
+if ("package:sp" %in% search()) detach("package:sp", unload=TRUE)
+if ("package:lattice" %in% search()) detach("package:lattice", unload=TRUE)
+if ("package:maps" %in% search()) detach("package:maps", unload=TRUE)
+
+cran_packages <- c("tidyselect", "tidyverse", "cluster", "ggdendro", "lubridate", "factoextra", 
+                   "ggpubr",  "corrplot", "BBmisc", "clValid", "ClustGeo",
+                   "gridExtra", "grid", "GGally", "ggforce", "gtools", "viridis")
+for (package in cran_packages) {
+  if(!require(package, character.only = TRUE)) install.packages(package, character.only = TRUE)
+  library(package, character.only = TRUE, quietly = TRUE)
+}
+
+rm(cran_packages)
+rm(package)
+```
+
+Load data from previous script
+```{r}
+load("../RData/3_Data_for_Clustering.RData")
+```
+
+Set default ggplot theme
+```{r}
+theme_set(theme_bw())
+theme_update(plot.title = element_text(hjust = 0.5))
+theme_update(plot.subtitle = element_text(hjust = 0.5))
+```
+
+
+## CorClustST
+
+### Choice of parameters
+From previous calculations, we already have the matrix of correlations and distances between points. Therefore, we can create a scatterplot of distance vs correlation.
+```{r}
+corr <- cor(x = weather_data %>%
+                     pivot_wider(id_cols = "measurement_date",
+                                 names_from = "station_id",
+                                 values_from = "weather_index") %>%
+                     dplyr::select(-measurement_date))
+data.frame(correlation = corr[lower.tri(corr)], 
+           distance     = as.numeric(geodist_matrix[lower.tri(geodist_matrix)])/1000) %>%
+  ggplot(aes(x = distance, y = correlation)) +
+  geom_point(size = 0.5) +
+  geom_smooth() +
+  labs(title = "Scatterplot of geographical distance vs. correlation",
+       x     = "geographical distance (km)",
+       y     = "correlation")
+```
+
+
+```{r}
+source("../Helpers/CorClustST.R")
+start_time <- Sys.time()
+CorClustST_results <- CorClustST(data = weather_data %>%
+                                   pivot_wider(id_cols = "measurement_date",
+                                               names_from = "station_id",
+                                               values_from = "weather_index") %>%
+                                   dplyr::select(-measurement_date), 
+                                 points = station_points,
+                                 ids = unique(station_data$station_id), 
+                                 epsilon = 200000,
+                                 rho = 0.75)
+end_time <- Sys.time()
+end_time - start_time
+
+ggplot(station_polygons) +
+  geom_sf(aes(fill=as.factor(CorClustST_results$clusters$label)),
+          size = 0.3, alpha = 0.6) +
+  labs(title="Map of clusters from CorClustST",
+       fill="Region",
+       subtitle="0=noise") +
+  scale_fill_manual(values = plasma(n = length(unique(CorClustST_results$clusters$label)))) +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+
+rm(list=lsf.str())
+rm(data_for_CorClustST)
+rm(end_time)
+rm(start_time)
+```
+
+```{r}
+rm(list = str_subset(string = ls(), pattern = "^.*CorClustST.*$", negate = TRUE))
+save.image("../RData/7_CorClustST_results.RData")
+```

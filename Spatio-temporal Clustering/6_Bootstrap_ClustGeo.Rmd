@@ -1,0 +1,145 @@
+---
+title: "3.4: Clustering with method Bootstrap ClustGeo"
+author: "Silvia Ventoruzzo"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Import packages
+```{r}
+# Detach the following packages and ClustGeo
+if ("package:raster" %in% search()) detach("package:raster", unload=TRUE)
+if ("package:spacetime" %in% search()) detach("package:spacetime", unload=TRUE)
+if ("package:sp" %in% search()) detach("package:sp", unload=TRUE)
+if ("package:lattice" %in% search()) detach("package:lattice", unload=TRUE)
+if ("package:maps" %in% search()) detach("package:maps", unload=TRUE)
+
+cran_packages <- c("tidyselect", "tidyverse", "cluster", "ggdendro", "lubridate", "factoextra", 
+                   "ggpubr",  "corrplot", "BBmisc", "clValid", "ClustGeo",
+                   "gridExtra", "grid", "GGally", "ggforce", "gtools", "viridis")
+for (package in cran_packages) {
+  if(!require(package, character.only = TRUE)) install.packages(package, character.only = TRUE)
+  library(package, character.only = TRUE, quietly = TRUE)
+}
+
+rm(cran_packages)
+rm(package)
+```
+
+Load data from previous script
+```{r}
+load("../RData/3_Data_for_Clustering.RData")
+load("../RData/5_ClustGeo_results.RData")
+```
+
+Set default ggplot theme
+```{r}
+theme_set(theme_bw())
+theme_update(plot.title = element_text(hjust = 0.5))
+theme_update(plot.subtitle = element_text(hjust = 0.5))
+```
+
+
+## Bootstrap ClustGeo
+Since `Bootstrap ClustGeo` is a development of `ClustGeo` and it is computationally intensive, it will be implemented only with the distance measure which produced the best results with `ClustGeo`.
+
+### Comparison of ClustGeo results
+The validation statistics will be calculated using the specific distance measure also employed in the clustering process.
+```{r}
+source("../Helpers/spatialcluster_comparison.R")
+
+dtw_matrix <- as.matrix(dtw_matrix_dist)
+eucl_matrix <- as.matrix(eucl_matrix_dist)
+
+combinations <- data.frame(results = paste0("CG_", c("corr", "eucl", "dtw"), "_results"),
+                           k       = paste0("k_CG_", c("corr", "eucl", "dtw")),
+                           dist    = paste0(c("corr", "eucl", "dtw"), "_matrix"),
+                           name    = paste0("CG_", c("corr", "eucl", "dtw")),
+                           stringsAsFactors = FALSE)
+
+lapply(1:nrow(combinations),
+       function(i) {
+         labels <- list(cutree(get(combinations$results[i]), k = get(combinations$k[i])))
+         names(labels) <- combinations$name[i]
+         comparisons <- spatialcluster_comparison(
+          labels_list = labels,
+          feature_distance_matrix = get(combinations$dist[i]), 
+          spatial_distance_matrix = geodist_matrix,
+          stats = c("dunn", "average.within", 
+                    "avg.silwidth",
+                    "connectivity"))
+         return(comparisons$validation_statistics)
+       }) %>%
+  bind_rows() %>%
+  arrange(distance, cluster_method)
+
+rm(list=lsf.str())
+rm(combinations)
+rm(dtw_matrix)
+rm(eucl_matrix)
+```
+
+Unfortunately, no distance measure results superior with respect to all statistics. However, the Euclidean distance gives good results with respect to the feature similarity as well as spatial contiguity. Therefore, also due to its low computational complexity, `Bootstrap ClustGeo` will be performed using the Euclidean distance.
+
+```{r}
+k_BCG <- k_CG_eucl
+alpha_BCG <- alpha_eucl
+
+rm(list = str_subset(string = ls(), pattern = "^.*corr.*$"))
+rm(list = str_subset(string = ls(), pattern = "^.*dtw.*$"))
+```
+
+## Clustering
+The number of clusters and mixing parameter $\alpha$ are the same ones used by ClustGeo (with same time series distance measure), i.e. $k = 4$ and $\alpha = 0.4$. The number of boostrap repetitions chosen is 1499, because it is appropriate for tests at the 0.01 level, according to “Bootstrap tests:  How many bootstraps? (Davidson, MacKinnon 2000).
+```{r}
+source("../Helpers/bootstrap_hclustgeo.R")
+source("../Helpers/hclust_nclust.R")
+
+data_for_BCG <- sapply(station_ids,
+       function(i) {
+         weather_data_norm %>%
+           filter(station_id == i) %>%
+           pivot_longer(cols = one_of(numeric_variables), names_to = "variable") %>%
+           pivot_wider(names_from = "measurement_date", 
+                       values_from = "value") %>%
+           dplyr::select(-station_id, -variable) %>%
+           as.matrix()
+         },
+       simplify = FALSE, USE.NAMES = TRUE)
+
+set.seed(1234)
+BCG_results <- bootstrap_hclustgeo(data = data_for_BCG, 
+                                   D1 = as.dist(geodist_matrix),
+                                   dist_measure = "euclidean",
+                                   bootstrap_nr = 1499, 
+                                   alpha = alpha_BCG,
+                                   scale = TRUE)
+
+
+hclust_nclust(hclust_result = BCG_results,
+               feature_distance_matrix = as.matrix(eucl_matrix_dist),
+               spatial_distance_matrix = geodist_matrix,
+              colors = cividis(n = 2, end = 0.8))
+
+ggplot(station_polygons) +
+  geom_sf(aes(fill=as.factor(cutree(BCG_results, k = k_BCG))),
+          size = 0.3, alpha = 0.6) +
+  labs(title="Map of clusters from Bootstrap GeoClust",
+       subtitle = paste0("alpha = ", alpha_BCG, " from choice using k = ", k_BCG),
+       fill="Region") +
+  scale_fill_manual(values = plasma(n = k_BCG)) +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+
+rm(data_for_BCG)
+rm(list=lsf.str())
+```
+
+```{r}
+rm(list = str_subset(string = ls(), pattern = "^.*BCG.*$", negate = TRUE))
+save.image("../RData/6_Bootstrap_ClustGeo_results.RData")
+```

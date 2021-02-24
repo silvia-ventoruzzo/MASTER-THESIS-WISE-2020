@@ -1,0 +1,1111 @@
+---
+title: "2.1: Preparation of Weather and Station Data"
+author: "Silvia Ventoruzzo"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load packages
+```{r}
+cran_packages <- c("tidyverse", "lubridate", "fuzzyjoin", "GGally",
+                   "dtwclust", "naniar", "gridExtra", "MVN",
+                   "grid", "ggpubr", "bestNormalize", "viridis",
+                   "Amelia", "corrplot", "fastDummies", "forecast")
+for (package in cran_packages) {
+  if(!require(package, character.only = TRUE)) install.packages(package, character.only = TRUE)
+  library(package, character.only = TRUE, quietly = TRUE)
+}
+if(!require(BaylorEdPsych)) install_version("BaylorEdPsych", 
+                                            version = "0.5", 
+                                            repos = "http://cran.us.r-project.org")
+library(BaylorEdPsych)
+
+rm(cran_packages)
+rm(package)
+```
+
+Set default ggplot theme
+```{r}
+theme_set(theme_bw())
+theme_update(plot.title = element_text(hjust = 0.5))
+theme_update(plot.subtitle = element_text(hjust = 0.5))
+```
+
+Import data
+```{r}
+weather_data <- read_delim(file = "../Data/weather_station_data/produkt_klima_alle_stationen.txt", 
+                           delim = ";")
+
+station_data <- read_delim(file = "../Data/weather_station_data/Metadaten_Geographie_alle_stationen.txt", 
+                           delim = ";")
+```
+
+```{r}
+# How many weather stations?
+length(unique(station_data$Stations_id))
+length(unique(weather_data$STATIONS_ID))
+
+# Period of measured weather
+min(weather_data$MESS_DATUM)
+```
+
+# Weather data
+
+## Clean 
+* Rename variables and factor levels according to description file
+* Keep only data for years between 2010 and 2019
+* Add rows for dates which are missing
+
+```{r}
+years_of_interest <- 2010:2019
+
+weather_data <- weather_data %>%
+  rename(station_id         = STATIONS_ID,
+         measurement_date   = MESS_DATUM,
+         quality_level      = QN_4,
+         precipitation_mm   = RSK,
+         precipitation_type = RSKF,
+         sunshine_h         = SDK,
+         temperature_c      = TMK,
+         temperature_c_max  = TXK,
+         temperature_c_min  = TNK,
+         humidity           = UPM,
+         wind_gust          = FX,
+         wind_speed         = FM,
+         snow_depth         = SHK_TAG,
+         cloud_cover        = NM,
+         vapor_pressure     = VPM,
+         pressure           = PM) %>%
+  mutate_all(~na_if(., -999)) %>%
+  mutate(measurement_date   = as.Date(as.character(measurement_date), format = "%Y%m%d"),
+         station_id         = str_pad(station_id, width = 5, pad = "0"),
+         quality_level      = as.factor(quality_level),
+         precipitation_type = na_if(precipitation_type, 4),
+         precipitation_type = na_if(precipitation_type, 9),
+         precipitation_type = case_when(precipitation_type == 0 ~ "none",
+                                        precipitation_type == 6 ~ "rain",
+                                        precipitation_type == 7 ~ "snow",
+                                        precipitation_type == 8 ~ "rain_and_snow")) %>%  
+  filter(between(year(measurement_date), min(years_of_interest), max(years_of_interest))) %>%
+  dplyr::select(-QN_3, 
+         -TGK, -eor) %>%
+  arrange(station_id, measurement_date)
+
+weather_data <- weather_data %>%
+  tidyr::complete(station_id, nesting(measurement_date))
+
+head(weather_data)
+```
+
+
+# Station data
+
+## Clean
+* date variables from numeric to Date
+* station_height from character to numeric
+* stations active (at least) since 2010
+```{r}
+station_data <- station_data %>%
+  rename(station_id     = Stations_id,
+         station_height = Stationshoehe,
+         lat            = Geogr.Breite,
+         lon            = Geogr.Laenge,
+         from_date      = von_datum,
+         to_date        = bis_datum,
+         station_name   = Stationsname) %>%
+  mutate_at(vars(contains("date")), function(x) as.Date(as.character(x), format = "%Y%m%d")) %>%
+  mutate(station_id = str_pad(station_id, width = 5, pad = "0")) %>%
+  arrange(station_id, from_date)
+
+head(station_data)
+```
+
+## Stations to keep
+We have orders starting in 2015, but we will use the 5 previous years to calculate the deciles used in producing the weather scores. Therefore, we need weather stations that have been active from 2010 on (`from_date` is before 2010, while `to_date` is missing because they are still active).
+
+Furthermore, I will keep only those stations which have no variable of interest completely missing, because the rest of the missing values will be filled later on.
+```{r}
+# Extract IDs of active stations
+active_stations <- station_data %>%
+  filter(year(from_date) <= 2010,
+         is.na(to_date)) %>%
+  pull(station_id)
+# Extract IDs of stations which have no days with no weather information
+empty_rows_stations <- weather_data %>%
+  filter_at(vars(-c("station_id", "measurement_date")), is.na) %>%
+  pull(station_id) %>%
+  unique()
+no_emptyrows_stations <- setdiff(unique(station_data$station_id), empty_rows_stations)
+# Extract IDs of stations which have no variable of interest completely missing
+variables_of_interest <- c("temperature_c", "sunshine_h", "precipitation_mm", "precipitation_type")
+no_noncomplete_stations <- weather_data %>%
+  group_by(station_id) %>%
+  summarize_at(variables_of_interest, function(x) sum(is.na(x))/length(x)) %>%
+  ungroup() %>%
+  filter_at(variables_of_interest, function(x) x < 1) %>%
+  pull(station_id)
+
+# Filter station_data with the stations from above
+station_data <- station_data %>%
+  filter(station_id %in% intersect(intersect(active_stations, no_noncomplete_stations),
+                                   no_emptyrows_stations))
+weather_data <- weather_data %>%
+  filter(station_id %in% intersect(intersect(active_stations, no_noncomplete_stations),
+                                   no_emptyrows_stations))
+
+cat("Number of weather stations left:", length(unique(station_data$station_id)))
+
+rm(active_stations)
+rm(empty_rows_stations)
+rm(no_emptyrows_stations)
+rm(no_noncomplete_stations)
+```
+
+## Station location and height
+According to the description file, weather stations might have changed location in time. 
+* station location: keep only the last one, since only needed for plotting
+* station height: this variable can be utilized for helping in filling missing values, therefore we have to assign it to the daily weather records according to their dates (fuzzy join: `measurement_date` >= `from_date` & `measurement_date` <= `to_date`)
+```{r}
+# To perform the fuzzy join we need to transform the to_date variable, 
+# since it has NA when station is still active.
+# Set current date as value
+station_data <- station_data %>%
+  mutate(to_date_filled = as.Date(ifelse(is.na(to_date), Sys.Date(), to_date), origin = "1970-01-01")) %>%
+  filter(year(to_date_filled) >= min(years_of_interest))
+
+# Fuzzy join with weather data
+weather_data <- weather_data %>%
+  fuzzy_left_join(station_data,
+                  by = c("station_id"       = "station_id",
+                         "measurement_date" = "from_date",
+                         "measurement_date" = "to_date_filled"),
+                  match_fun = list(`==`, `>=`, `<=`)) %>%
+  rename(station_id = station_id.x) %>%
+  select(-station_id.y, -lat, -lon, -from_date, -to_date, -station_name, -to_date_filled)
+```
+
+# Descriptive analysis
+
+Correlation
+```{r}
+correlation <- cor(weather_data %>% select_if(is.numeric), use = "pairwise.complete.obs")
+correlation %>%
+  as.data.frame() %>%
+  rownames_to_column()
+
+corrplot(corr = correlation, 
+         type = "lower", order="original",
+         tl.col = "black", tl.srt = 20,
+         col = viridis(n = 200, begin = 1, end = 0)
+         )
+```
+
+
+```{r}
+weather_variables <- setdiff(variables_of_interest, "precipitation_type")
+```
+
+## Plots
+
+Pairs plot
+```{r}
+weather_data %>%
+  dplyr::select(all_of(weather_variables)) %>%
+  ggpairs(title = "Pairs plot of numerical variables of interest", 
+          lower = list(continuous = wrap("smooth", size = 0.3, na.rm = TRUE, color = "blue")),
+          progress = FALSE) +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r}
+weather_data %>%
+  drop_na(precipitation_type) %>%
+  dplyr::select(all_of(variables_of_interest)) %>%
+  ggpairs(title = "Pairs plot of variables of interest", 
+          lower = list(continuous = wrap("smooth", size = 0.3, na.rm = TRUE, color = "blue"),
+                       combo = wrap("denstrip", na.rm = TRUE),
+                       discrete = wrap("facetbar", na.rm =  TRUE)),
+          diag = list(discrete = wrap("barDiag", na.rm = TRUE)),
+          upper = list(combo = wrap("box_no_facet", na.rm = TRUE),
+                       discrete = wrap("facetbar", na.rm = TRUE)),
+          progress = FALSE) + 
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        strip.text.y = element_text(size = 6))
+```
+
+With combination of precipitation_mm and precipitation_type to have all numeric variables
+```{r}
+weather_data %>%
+  dplyr::select(station_id, measurement_date, all_of(variables_of_interest)) %>%
+  dummy_cols(select_columns = "precipitation_type") %>%
+  mutate_at(vars(starts_with("precipitation_type_")), ~.x*precipitation_mm) %>%
+  rename_at(vars(starts_with("precipitation_type_")), ~paste0(gsub("precipitation_type_", "", .x), "_mm")) %>%
+  dplyr::select(all_of(weather_variables),
+                all_of(paste0(unique(.$precipitation_type), "_mm")),
+                -precipitation_mm, -NA_mm) %>%
+  ggpairs(title = "Pairs plot of variables of interest", 
+        lower = list(continuous = wrap("smooth", size = 0.3, na.rm = TRUE, color = "blue"),
+                     combo = wrap("denstrip", na.rm = TRUE),
+                     discrete = wrap("facetbar", na.rm =  TRUE)),
+        diag = list(discrete = wrap("barDiag", na.rm = TRUE)),
+        upper = list(combo = wrap("box_no_facet", na.rm = TRUE),
+                     discrete = wrap("facetbar", na.rm = TRUE)),
+        # lower = list(continuous = "smooth"),
+        progress = FALSE) + 
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        strip.text.x = element_text(size = 8))
+```
+
+Boxplots precipitation_type vs other variables
+```{r}
+weather_data %>%
+  drop_na(precipitation_type) %>%
+  pivot_longer(cols = all_of(weather_variables), names_to = "variable") %>%
+  ggplot(aes(x = precipitation_type, y = value)) +
+  geom_boxplot() +
+  facet_wrap(~variable, scales = "free_y") +
+  labs(y = "",
+       title = "Boxplot by numeric variables of interest by precipitation type") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+```
+
+Boxplot precipitation_type vs precipitation_mm where precipitation_mm != 0
+```{r}
+weather_data %>%
+  drop_na(precipitation_type) %>%
+  filter(precipitation_mm != 0) %>%
+  ggplot(aes(x = precipitation_type, y = precipitation_mm)) +
+  geom_boxplot() +
+  labs(title = "Boxplot of precipitation_mm by precipitation_type",
+       subtitle = "Where precipitation_mm is different from 0") +
+  theme(axis.title.y = element_blank(),
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+```
+
+
+Time series of means
+```{r}
+weather_data %>%
+  group_by(measurement_date) %>%
+  summarize_at(vars(weather_variables), mean, na.rm = TRUE) %>%
+  ungroup() %>%
+  pivot_longer(cols = all_of(weather_variables), 
+               names_to = "variable") %>%
+  ggplot() +
+  geom_line(aes(x = measurement_date, y = value), size = 0.2) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  facet_wrap(~variable, nrow = 3, scales = "free_y") +
+  labs(title = "Time series of numeric variables of interest",
+       x = "time") +
+  theme(axis.title.y = element_blank())
+```
+
+```{r}
+# Indicate starting date of time series
+start_date <- min(weather_data$measurement_date)
+start_date <- c(year(start_date), month(start_date), day(start_date))
+
+# Calculate daily mean
+weather_data_means <- weather_data %>%
+  group_by(measurement_date) %>%
+  summarize_at(vars(all_of(weather_variables)), mean, na.rm = TRUE) %>%
+  ungroup()
+# Create empty object
+ts_decomposed <- list()
+
+ts_decomposed <- sapply(weather_variables,
+                        function(i) {
+                          # Create time series for specific combination of weather station and variable
+                          ts_var <- weather_data_means %>%
+                            dplyr::select(all_of(i)) %>%
+                            ts(start = start_date,
+                               frequency = 365+1* (!start_date[1]%%400 || ((start_date[1]%%100)&&!start_date[1]%%4)))
+                          # Calculate decomposition of time series for variable
+                          var_decomposed <- decompose(ts_var, type="additive")
+                          return(var_decomposed)
+                        },
+                        simplify = FALSE, USE.NAMES = TRUE)
+
+lapply(names(ts_decomposed),
+       function(i) {
+         autoplot(ts_decomposed[[i]], range.bars = FALSE) +
+           scale_x_continuous(breaks = c(years_of_interest, max(years_of_interest)+1)) +
+           theme_bw() +
+           labs(title = paste0("Decomposition of time series of means of ", i),
+                x = "time") +
+           theme(plot.title = element_text(hjust = 0.5),
+                 axis.title.y = element_blank())
+       })
+
+rm(start_date)
+```
+
+### Autocorrelation of univariate time series
+
+```{r}
+source("../Helpers/ts_corr_plot.R")
+
+lapply(weather_variables,
+       function(i) {
+         ts_corr_plot(x = weather_data_means[[i]]) +
+           labs(subtitle = paste0("Variable = ", i)) +
+          theme(plot.subtitle = element_text(hjust = 0.5))
+       })
+
+rm(list=lsf.str())
+```
+
+## Descriptive statistics
+
+General
+```{r}
+source("../Helpers/descriptive_statistics.R")
+
+# Numeric variables
+weather_data %>%
+  group_by(measurement_date) %>%
+  summarize_at(vars(weather_variables), mean, na.rm = TRUE) %>%
+  ungroup() %>%
+  descr_numerical()
+
+# Categorical variables variables
+weather_data %>%
+  drop_na(precipitation_type) %>%
+  group_by(measurement_date) %>%
+  summarize_at(vars(precipitation_type),
+               function(v) {
+                 uniqv <- unique(v)
+                 # uniqv <- uniqv[uniqv != "NA."]
+                 return(uniqv[which.max(tabulate(match(v, uniqv)))])
+                 }) %>%
+  ungroup() %>%
+  dplyr::select(precipitation_type) %>%
+  descr_categorical()
+
+# Station height
+station_data %>%
+  group_by(station_id) %>%
+  summarize(station_height = mean(station_height)) %>%
+  ungroup() %>%
+  descr_numerical()
+
+rm(list=lsf.str())
+```
+
+Descriptive statistics of numerical variables with respect with precipitation_type
+```{r}
+source("../Helpers/descriptive_statistics.R")
+
+descr_num <- weather_data %>%
+  drop_na(precipitation_type) %>%
+  dplyr::select(all_of(variables_of_interest)) %>%
+  group_by(precipitation_type) %>%
+  group_map(~descr_numerical(.x))
+
+names(descr_num)  <- sort(unique(weather_data$precipitation_type)[!is.na(unique(weather_data$precipitation_type))])
+descr_num <- lapply(names(descr_num),
+               function(i) {
+                 descr_num[[i]] %>%
+                   mutate(precipitation_type = i)
+               }) %>%
+  bind_rows() 
+
+descr_num %>%
+  arrange(precipitation_type, desc(variable)) %>%
+  dplyr::select(precipitation_type, variable, min, `1Q`, median, `3Q`, max, IQR, mean, sd)
+
+rm(descr_num)
+rm(list=lsf.str())
+```
+
+```{r}
+length(unique(weather_data$station_id))
+```
+
+
+# Imputation of missing values 
+
+```{r}
+# Percentage of missing values per column
+apply(weather_data, 2, function(x) sum(is.na(x))/length(x))
+```
+
+The process will be done in two steps:
+1. general rules: if `precipitation_mm` is equal to zero, then `precipitation_type` will be set equal to none, and the other way around
+2. impute missing values using `Amelia`
+
+```{r}
+weather_data <- weather_data %>%
+  mutate(precipitation_type = ifelse(precipitation_mm == 0, "none", precipitation_type),
+         precipitation_mm   = ifelse((is.na(precipitation_mm)) & (precipitation_type == "none"), 
+                                     0, precipitation_mm))
+```
+
+Percentage of missing values per column
+```{r}
+apply(weather_data, 2, function(x) sum(is.na(x))/length(x))
+```
+
+Create boxplots of numerical weather variables with respect to `precipitation_type`.
+```{r}
+weather_data %>%
+  pivot_longer(cols = colnames(select_if(., is.numeric)),
+               names_to = "weather_variable", values_to = "weather_value") %>%
+  filter(!is.na(precipitation_type)) %>%
+  ggplot() +
+  geom_boxplot(aes(x = precipitation_type, y = weather_value, color = precipitation_type),
+               show.legend = FALSE) +
+  facet_wrap(~ weather_variable, scales = "free_x") +
+  coord_flip() +
+  theme_bw() +
+  theme(axis.title.x = element_blank()) +
+  labs(title = "Boxplots for different precipitation types and variables.")
+```
+
+```{r}
+weather_data %>%
+  select_if(is.numeric) %>%
+  pivot_longer(cols = everything(),
+               names_to = "weather_variable", values_to = "weather_value") %>%
+  ggplot() +
+  geom_density(aes(x = weather_value)) +
+  facet_wrap(~ weather_variable, scales = "free")
+
+weather_data %>%
+  pivot_longer(cols = colnames(select_if(., is.numeric)),
+               names_to = "weather_variable", values_to = "weather_value") %>%
+  ggplot() +
+  geom_boxplot(aes(x = precipitation_type, y = weather_value)) +
+  facet_wrap(~ weather_variable, scales = "free_y")
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Little's Test for MCAR
+Check if data is missing at random.
+```{r}
+little_test <- weather_data %>%
+  filter_all(any_vars(!is.na(.))) %>%
+  select_if(~sum(!is.na(.)) > 0) %>%
+  select_if(is.numeric) %>%
+  LittleMCAR()
+
+data.frame(chi_square = little_test$chi.square,
+           degrees_of_freedom = little_test$df,
+           p_value = little_test$p.value)
+
+rm(list=lsf.str())
+```
+
+
+## Visualization of missing data
+https://cran.r-project.org/web/packages/naniar/vignettes/getting-started-w-naniar.html
+https://cran.r-project.org/web/packages/naniar/vignettes/naniar-visualisation.html
+```{r}
+weather_data %>%
+  mutate(month_n = paste0(year(measurement_date), "-", 
+                          str_pad(month(measurement_date), 2, "left", "0"))) %>%
+  group_by(station_id, month_n) %>%
+  summarize_at(vars(weather_variables), mean) %>%
+  ungroup() %>%
+  # select_at(vars(weather_variables)) %>%
+  vis_miss(warn_large_data = FALSE) +
+  labs(y = "observation number",
+       title = "Visualization of missing values",
+       subtitle = "Data downsampled at the month level")
+
+
+weather_data %>%
+  mutate(month_n = paste0(year(measurement_date), "-", 
+                          str_pad(month(measurement_date), 2, "left", "0"))) %>%
+  group_by(station_id, month_n) %>%
+  summarize_at(vars(variables_of_interest), 
+               function(x) {
+                 uniqx <- unique(x)
+                 mode <- uniqx[which.max(tabulate(match(x, uniqx)))]
+                 return(mode)
+               }) %>%
+  ungroup() %>%
+  # select_at(vars(weather_variables)) %>%
+  vis_miss(warn_large_data = FALSE) +
+  labs(y = "observation number",
+       title = "Visualization of missing values",
+       subtitle = "Data downsampled at the month level")
+```
+
+Exploration of relationship among the numeric variables of interest.
+```{r}
+variable_grid <- expand.grid(variable_1 = weather_variables,
+                             variable_2 = weather_variables,
+                             stringsAsFactors = FALSE) %>%
+  filter(variable_1 != variable_2)
+
+plot_list <- list()
+for (n in 1:nrow(variable_grid)) {
+  plot_list[[n]] <- weather_data %>%
+    ggplot(aes(x = !!sym(variable_grid[n, 1]), y = !!sym(variable_grid[n, 2]))) + 
+    geom_miss_point(size = 0.5, alpha = 0.8) +
+    scale_color_manual(values = viridis(n = 2, begin = 0, end = 0.8)) +
+    theme_bw() +
+    theme(axis.title      = element_text(size = 10),
+          legend.title    = element_blank(),
+          legend.position = "bottom")
+}
+
+arranged_plot <- ggarrange(plotlist = plot_list, ncol = 2, nrow = 3, 
+                           common.legend = TRUE, legend = "bottom")
+
+annotate_figure(arranged_plot,
+                top = text_grob("Scatterplots with missing values", size = 12),
+                bottom = text_grob("Missing values displayed 10% below minimum value",
+                                   hjust = 1, x = 1, size = 8))
+ggsave(filename = "scatterplots_missing.png",
+       path = "figures/station_weather")
+
+rm(n)
+rm(plot_list)
+rm(arranged_plot)
+```
+
+Density comparison for data where one of the variables is missing
+```{r}
+weather_data_nabular <- bind_shadow(weather_data) %>%
+  mutate_at(vars(ends_with("NA")),
+            function(x) ifelse(as.character(x) == "NA", "Missing", "Not Missing"))
+
+variable_grid <- variable_grid %>%
+  mutate(variable_NA = paste0(variable_2, "_NA"))
+
+plot_list <- list()
+for (n in 1:nrow(variable_grid)) {
+  plot_list[[n]] <- weather_data_nabular %>%
+    ggplot(aes(x = !!sym(variable_grid[n, 1]), color = !!sym(variable_grid[n, 3]))) +
+    geom_line(stat = "density") +
+    annotate(geom = "text", 
+             label = paste0("With respect to\n", gsub("_NA", "", sym(variable_grid[n, 3]))), 
+             x = Inf, y = Inf, hjust = 1.1, vjust = 1.1, size = 3) +
+    scale_color_manual(values = viridis(n = 2, begin = 0, end = 0.8)) +
+    theme_bw() +
+    theme(axis.title      = element_text(size = 10),
+          legend.title    = element_blank(),
+          legend.position = "bottom")
+}
+
+arranged_plot <- ggarrange(plotlist = plot_list, ncol = 2, nrow = 3, 
+                           common.legend = TRUE, legend = "bottom")
+
+annotate_figure(arranged_plot,
+                top = text_grob("Density plots of known and missing values.", size = 12))
+
+rm(n)
+rm(plot_list)
+rm(arranged_plot)
+rm(weather_data_nabular)
+```
+
+There seems to be no pattern in the missing data of the weather variables of interest, therefore it will be assumed that they MCAR.
+
+
+## Imputation using Amelia
+
+Even though `Amelia` works well even when data is not multivariate normal, we will make use of the possible transformations offered (log, sqrt, logistic) to achieve a distribution as close as possible to the normal to improve results.
+
+1. Test multivariate normality (MVN)
+2. Find best normalization transformation (bestNormalize)
+3. Test multivariate normality again (MVN) - hoping for better result
+
+### Initial test of multivariate normality
+```{r}
+before_mvn_test <- sapply(c("mardia", "hz", "dh"),
+       function(i) {
+         cat("Running", i, "\n")
+         mvn_test <- weather_data %>%
+           dplyr::select(-measurement_date, -quality_level, -precipitation_type, -station_height) %>%
+           drop_na() %>%
+           MVN::mvn(subset = "station_id", mvnTest = i, scale = TRUE)
+         lapply(names(mvn_test$multivariateNormality),
+                function(j) {
+                  mvn_test$multivariateNormality[[j]] %>%
+                    mutate(station_id = j)
+                  }) %>%
+           bind_rows()
+       },
+       simplify = FALSE, USE.NAMES = TRUE)
+
+lapply(names(before_mvn_test),
+       function(i) {
+         before_mvn_test[[i]] %>%
+           dplyr::select(-matches("df")) %>%
+           rename(Statistic = 2,
+                  Result = 4) %>%
+           mutate_at(vars(c("p value", "Statistic")),
+                     function(x) as.numeric(as.character(x))) %>%
+           mutate_if(is.vector, as.character)
+       }) %>%
+  bind_rows() %>%
+  filter(Result == "YES")
+```
+
+### Finding the best transformations
+```{r}
+numeric_variables <- weather_data %>%
+  select_if(is.numeric) %>%
+  colnames()
+
+
+variable_transformations <- lapply(numeric_variables,
+                                   function(i) {
+                                     weather_data %>%
+                                       pull(i) %>%
+                                       bestNormalize(standardize = FALSE,
+                                                     allow_orderNorm = FALSE)
+                                   }) %>%
+  setNames(nm = numeric_variables)
+```
+
+
+Since `Amelia` only permits log, sqrt and logarithmic transformation, we will only consider these. Therefore, for each variable, we will extract the transformation (or no transformation) among these which has the lowest estimated normality statistics (Pearson P).
+```{r}
+# Get all the data into a dataframe
+transformation_comparison <- lapply(numeric_variables,
+                                 function(i) {
+                                   output <- tolower(capture.output(variable_transformations[[i]]))
+                                   cleaned_output <- gsub(" - ", "",
+                                                          output[grepl(" - ", output)])
+                                   comparison <- data.frame(output = cleaned_output) %>%
+                                     filter(grepl("^log|sqrt|no transform", output)) %>%
+                                     separate(col = "output", 
+                                              into = c("transformation", "normality_stat"), 
+                                              sep = ": ") %>%
+                                     mutate(variable = i)
+                                 }) %>%
+  bind_rows()
+
+chosen_transformation <- transformation_comparison %>%
+  group_by(variable) %>%
+  filter(normality_stat == min(normality_stat)) %>%
+  ungroup()
+
+variables_to_transform <- lapply(c("log", "sqrt"),
+      function(i) {
+        chosen_transformation %>%
+          filter(grepl(paste0("^", i), transformation)) %>%
+          pull(variable)
+      }) %>%
+  setNames(nm = c("log_variables", "sqrt_variables"))
+
+variables_to_transform
+
+rm(transformation_comparison)
+rm(chosen_transformation)
+```
+
+
+### Final test of multivariate normality
+
+Apply transformations and test normality again
+```{r}
+weather_data_transformed <- weather_data %>%
+  mutate_at(vars(variables_to_transform$log_variables), function(x) log(pmax(x, 1e-100))) %>%
+  mutate_at(vars(variables_to_transform$sqrt_variables), function(x) sqrt(pmax(x, 0)))
+
+after_mvn_test <- sapply(c("mardia", "hz", "dh"),
+       function(i) {
+         cat("Running", i, "\n")
+         mvn_test <- weather_data_transformed %>%
+           dplyr::select(-measurement_date, -quality_level, -precipitation_type, -station_height) %>%
+           drop_na() %>%
+           MVN::mvn(subset = "station_id", mvnTest = i, scale = TRUE) 
+         lapply(names(mvn_test$multivariateNormality),
+                function(j) {
+                  mvn_test$multivariateNormality[[j]] %>%
+                    mutate(station_id = j)
+                  }) %>%
+           bind_rows()
+       },
+       simplify = FALSE, USE.NAMES = TRUE)
+
+lapply(names(after_mvn_test),
+       function(i) {
+         before_mvn_test[[i]] %>%
+           select(-matches("df")) %>%
+           rename(Statistic = 2,
+                  Result = 4) %>%
+           mutate_at(vars(c("p value", "Statistic")),
+                     function(x) as.numeric(as.character(x))) %>%
+           mutate_if(is.vector, as.character)
+       }) %>%
+  bind_rows() %>%
+  filter(Result == "YES")
+
+rm(weather_data_transformed)
+```
+
+Compare Multivariate Normality Results
+```{r}
+mvn_test_comparison <- lapply(names(after_mvn_test),
+       function(i) {
+         before <- before_mvn_test[[i]] %>%
+           dplyr::select(-matches("df")) %>%
+           rename(Statistic = 2,
+                  Result = 4) %>%
+           mutate_if(is.vector, as.character) %>%
+          mutate_at(vars(c("p value", "Statistic")), as.numeric) %>%
+           mutate(transformation = "stat_before")
+         after <- after_mvn_test[[i]] %>%
+           dplyr::select(-matches("df")) %>%
+           rename(Statistic = 2,
+                  Result = 4) %>%
+           mutate_if(is.vector, as.character) %>%
+           mutate_at(vars(c("p value", "Statistic")), as.numeric) %>%
+           mutate(transformation = "stat_after")
+         return(bind_rows(before, after))
+       }) %>%
+  bind_rows() %>%
+  pivot_wider(id_cols = c("Test", "station_id"), names_from = "transformation", values_from = "Statistic") 
+
+mvn_test_comparison %>%
+  filter((stat_after < stat_before))
+
+rm(list = str_subset(ls(), "mvn"))
+```
+
+The transformations did not make the data multivariate normal, but the statistics are usually lower, except for some cases for the Doornik-Hansen test. Therefore, we will compare missing data imputation by the algorithm `Amelia` with and without transformations.
+
+### Variable bounds
+`Amelia` allows for setting feature bounds, which will come in handy since some of the variables, for example, do not allow for negative values.
+```{r}
+source("../Helpers/descriptive_statistics.R")
+weather_data %>%
+    descr_numerical()
+
+rm(descr_numerical)
+rm(descr_categorical)
+```
+
+Except for `temperature_c` and `station_height`, all other variables are positive, therefore I will enforce a lower bound on these.
+```{r}
+bounded_variables <- setdiff(numeric_variables, c("temperature_c", "station_height"))
+variable_bounds <- data.frame(column.number = which(colnames(weather_data) %in% bounded_variables),
+                              lower.bound   = rep(0, length(bounded_variables)),
+                              upper.bound   = rep(Inf, length(bounded_variables))) %>%
+  as.matrix()
+
+rm(bounded_variables)
+```
+
+
+### Test that transformations improve imputation quality
+What we are interested in is imputing missing data for the following variables: `temperature_c`, `sunshine_h`, `precipitation_mm` and `precipitation_type`. Since there are no stations that have no missing value in all variables, we will restrict the test to those stations that have no missing values in the variables of interest. 
+```{r}
+stations_for_test <- weather_data %>%
+  group_by(station_id) %>%
+  summarize_at(vars(variables_of_interest), function(x) sum(is.na(x))/length(x)) %>%
+  ungroup() %>%
+  filter_at(vars(variables_of_interest), function(x) x == 0) %>%
+  pull(station_id)
+
+station_data %>%
+  filter(station_id %in% stations_for_test)
+```
+
+Filter data by station_id
+```{r}
+full_data <- weather_data %>%
+  filter(station_id %in% stations_for_test)
+```
+
+
+With and without transformation
+```{r}
+source("../Helpers/MTSbootstrapping.R")
+
+# Without time polynomials
+before_error_list <- MTSbootstrapping(df_complete = full_data,
+                                    funs = "Amelia",
+                                    ts_variable = "measurement_date",
+                                    cs_variable = "station_id",
+                                    bootstrap_nr = 1000,
+                                    missing_fact = 0.25,
+                                    lags = setdiff(numeric_variables, "station_height"),
+                                    leads = setdiff(numeric_variables, "station_height"),
+                                    noms = c("quality_level", "precipitation_type"),
+                                    bounds = variable_bounds,
+                                    ci_imputations = FALSE,
+                                    ci_level = 0.95,
+                                    ci_type = "se")
+save(before_error_list, 
+     file = "../Amelia_imputation_tests/Amelia_before_polytimeNULL_splinetimeNULL.RData")
+rm(before_error_list)
+after_error_list <- MTSbootstrapping(df_complete = full_data,
+                                   funs = "Amelia",
+                                   ts_variable = "measurement_date",
+                                   cs_variable = "station_id",
+                                   bootstrap_nr = 1000,
+                                   missing_fact = 0.25,
+                                   lags = setdiff(numeric_variables, "station_height"),
+                                   leads = setdiff(numeric_variables, "station_height"),
+                                   logs = variables_to_transform$log_variables,
+                                   sqrts = variables_to_transform$sqrt_variables,
+                                   noms = c("quality_level", "precipitation_type"),
+                                   bounds = variable_bounds,
+                                   ci_imputations = FALSE,
+                                   ci_level = 0.95,
+                                   ci_type = "se")
+save(after_error_list, 
+     file = "../Amelia_imputation_tests/Amelia_after_polytimeNULL_splinetimeNULL.RData")
+rm(after_error_list)
+
+# With time polynomials
+time_polynomials <- expand.grid(polytime = 0:3, splinetime = 0:3)
+for (i in 1:nrow(time_polynomials)) {
+  cat("Imputing with polytime =", time_polynomials$polytime[[i]], 
+      "and splinetime =", time_polynomials$splinetime[[i]], "\n")
+  # Without transformations
+  before_error_list <- MTSbootstrapping(df_complete = full_data,
+                                      funs = "Amelia",
+                                      ts_variable = "measurement_date",
+                                      cs_variable = "station_id",
+                                      bootstrap_nr = 1000,
+                                      missing_fact = 0.25,
+                                      lags = setdiff(numeric_variables, "station_height"),
+                                      leads = setdiff(numeric_variables, "station_height"),
+                                      noms = c("quality_level", "precipitation_type"),
+                                      bounds = variable_bounds,
+                                      polytime = time_polynomials$polytime[[i]],
+                                      splinetime = time_polynomials$splinetime[[i]],
+                                      ci_imputations = FALSE,
+                                      ci_level = 0.95,
+                                      ci_type = "se")
+  save(before_error_list, 
+       file = paste0("../Amelia_imputation_tests/",
+                     "Amelia_before_polytime", time_polynomials$polytime[[i]],
+                     "_splinetime", time_polynomials$splinetime[[i]], ".RData"))
+  rm(before_error_list)
+  # With transformations
+  after_error_list <- MTSbootstrapping(df_complete = full_data,
+                                     funs = "Amelia",
+                                     ts_variable = "measurement_date",
+                                     cs_variable = "station_id",
+                                     bootstrap_nr = 1000,
+                                     missing_fact = 0.25,
+                                     lags = setdiff(numeric_variables, "station_height"),
+                                     leads = setdiff(numeric_variables, "station_height"),
+                                     logs = variables_to_transform$log_variables,
+                                     sqrts = variables_to_transform$sqrt_variables,
+                                     noms = c("quality_level", "precipitation_type"),
+                                     bounds = variable_bounds,
+                                     polytime = time_polynomials$polytime[[i]],
+                                     splinetime = time_polynomials$splinetime[[i]],
+                                     ci_imputations = FALSE,
+                                     ci_level = 0.95,
+                                     ci_type = "se")
+  rm(after_error_list)
+}
+
+rm(time_polynomials)
+rm(list=lsf.str())
+```
+
+
+```{r}
+source("../Helpers/imputation_comparison.R")
+Amelia_imputation_errors <- list()
+# Without time polynomials
+before_error_list <- lapply(1:length(before_error_list),
+                          function(i) {
+                            before_error_list[[i]] %>%
+                              mutate(type = "Without transformations")
+                            })
+after_error_list <- lapply(1:length(after_error_list),
+                         function(i) {
+                           before_error_list[[i]] %>%
+                             mutate(type = "With transformations")
+                           })
+  Amelia_imputation_errors[["polytime = NULL;spltime = NULL"]] <- 
+    imputation_comparison(stats1 = before_error_list,  stats2 = after_error_list,
+                          subtitle = paste0("1000 bootstraps; polytime = NULL; spltime = NULL"))
+
+# With time polynomials
+time_polynomials <- expand.grid(polytime = 0:3, splinetime = 0:3)
+for (i in 1:nrow(time_polynomials)) {
+  # Transform data
+  before_error_list <- lapply(1:length(before_error_list),
+                            function(i) {
+                              before_error_list[[i]] %>%
+                                mutate(type = "Without transformations")
+                              })
+  after_error_list <- lapply(1:length(after_error_list),
+                           function(i) {
+                             before_error_list[[i]] %>%
+                               mutate(type = "With transformations")
+                             })
+  # Calculate tstat and produce plot
+  Amelia_imputation_errors[[paste0("polytime = ", time_polynomials$polytime[[i]],
+                                   ";spltime = ", time_polynomials$splinetime[[i]])]] <- 
+    imputation_comparison(stats1 = before_error_list, stats2 = after_error_list,
+                          subtitle = paste0("1000 bootstraps; ",
+                                            "polytime = ", time_polynomials$polytime[[i]],
+                                            "; spltime = ", time_polynomials$splinetime[[i]]))
+}
+rm(i)
+rm(before_error_list)
+rm(after_error_list)
+rm(time_polynomials)
+rm(list=lsf.str())
+```
+
+
+As we can see from the plots and the results from the t-test, there is no visible difference in applying the transformations.
+```{r}
+lapply(names(Amelia_imputation_errors),
+       function(i) {print(Amelia_imputation_errors[[i]]$comparison_plot)})
+```
+
+However, the combination of polytime and spltime which yielded the best results is: 
+polytime = 2
+spltime = 0
+```{r}
+combination_comparison <- lapply(names(Amelia_imputation_errors),
+       function(i) {
+         Amelia_imputation_errors[[i]]$confidence_intervals %>%
+           mutate(polynomial_combination = i)
+         }) %>%
+  bind_rows() %>%
+  filter(type == "Without transformations") %>%
+  select(-type)
+
+lapply(unique(combination_comparison$stat),
+       function(i) {
+         combination_comparison %>%
+           filter(stat == i) %>%
+           mutate(ci_diff = ci_upper_97.5 - ci_lower_2.5) %>%
+           filter((mean == min(mean)) | ci_diff == min(ci_diff))
+       })
+
+rm(variable_to_transform)
+rm(variable_transformations)
+rm(Amelia_imputation_errors)
+rm(combination_comparison)
+```
+
+### Imputation of missing values
+
+```{r}
+precipitation_type_levels <- data.frame(
+  precipitation_type_char = unique(na.omit(weather_data$precipitation_type)),
+  precipitation_type_num = 1:n_distinct(weather_data$precipitation_type, na.rm = TRUE),
+  stringsAsFactors = FALSE)
+
+weather_data <- weather_data %>%
+  mutate(quality_level = as.numeric(as.character(quality_level)),
+         precipitation_type = recode(precipitation_type, 
+                                     !!!setNames(precipitation_type_levels$precipitation_type_num,
+                                                 precipitation_type_levels$precipitation_type_char)))
+
+# Imputation
+weather_data_imputation <- amelia(x  = weather_data,
+                                  ts = "measurement_date",
+                                  cs = "station_id",
+                                  m  = 1000,
+                                  lags = setdiff(numeric_variables, "station_height"),
+                                  leads = setdiff(numeric_variables, "station_height"),
+                                  noms = "precipitation_type",
+                                  ords = "quality_level",
+                                  bounds = variable_bounds,
+                                  polytime = 2,
+                                  spltime = 0,
+                                  p2s = 2)
+
+# For numeric variables we take the mean, for categorical variables we take the mode
+# Since all variables were transformed to numeric before using Amelia, we can use both on the same variables
+weather_data_imputed <- weather_data_imputation$imputations %>%
+  bind_rows() %>%
+  group_by(station_id, measurement_date) %>%
+  summarize_all(list(mean = mean,
+                     mode = function(x) {
+                       ux <- unique(x)
+                       ux[which.max(tabulate(match(x, ux)))]
+                     })) %>%
+  ungroup() %>%
+  rename(quality_level = quality_level_mode,
+         precipitation_type = precipitation_type_mode) %>%
+  rename_at(vars(paste0(numeric_variables, "_mean")),
+            function(x) gsub("_mean", "", x)) %>%
+  mutate(quality_level = as.factor(quality_level),
+         precipitation_type = recode(precipitation_type,
+                                     !!!setNames(precipitation_type_levels$precipitation_type_char, 
+                                                 precipitation_type_levels$precipitation_type_num))) %>%
+  select_at(vars(-ends_with("mean"), -ends_with("mode")))
+
+rm(list=setdiff(ls(), c("weather_data", "station_data",
+                        "weather_data_imputed", "numeric_variables",
+                        "weather_variables", "variables_of_interest",
+                        "years_of_interest")))
+```
+
+
+Plot
+```{r}
+source("../Helpers/TSimputation_diagnostics.R")
+
+diagnostics <- TSimputation_diagnostics(df_missing = weather_data, 
+                                        df_imputed = weather_data_imputed, 
+                                        ts_variable = "measurement_date", 
+                                        cs_variable = "station_id",
+                                        relevant_variables = weather_variables,
+                                        size = 0.2)
+
+
+weather_data %>%
+  group_by(station_id) %>%
+  summarize_all(function(x) sum(is.na(x))/length(x)) %>%
+  ungroup() %>%
+  filter((precipitation_mm == max(precipitation_mm)) |
+           (temperature_c == max(temperature_c)) |
+           (sunshine_h == max(sunshine_h))) %>%
+  select(station_id, all_of(weather_variables))
+# 03623
+# 02315
+
+diagnostics$timeseries_plot$`03623`
+diagnostics$timeseries_plot$`02315`
+```
+
+Add information if observations were missing
+```{r}
+weather_data <- weather_data %>%
+  mutate_at(vars(-station_id, -measurement_date),
+            list(missing = is.na)) %>%
+  dplyr::select(station_id, measurement_date, ends_with("missing"))
+weather_data <- weather_data_imputed %>%
+  left_join(weather_data, by = c("station_id", "measurement_date"))
+```
+
+# Group station_data by station_id
+```{r}
+station_data <- station_data %>%
+  group_by(station_id) %>%
+  summarize(station_name   = last(station_name),
+            lat            = mean(lat),
+            lon            = mean(lon),
+            station_height = mean(station_height)) %>%
+  ungroup()
+```
+
+```{r}
+nrow(station_data)
+length(unique(weather_data$station_id))
+```
+
+
+```{r}
+rm(list=setdiff(ls(), c("weather_data", "station_data", "variables_of_interest", "weather_variables")))
+save.image(file = "../RData/1_Weather_Station_Data.RData")
+```
+

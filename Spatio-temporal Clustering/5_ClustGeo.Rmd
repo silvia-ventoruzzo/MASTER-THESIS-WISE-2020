@@ -1,0 +1,468 @@
+---
+title: "3.3: Clustering with method ClustGeo"
+author: "Silvia Ventoruzzo"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Import packages
+```{r}
+# Detach the following packages and ClustGeo
+if ("package:raster" %in% search()) detach("package:raster", unload=TRUE)
+if ("package:spacetime" %in% search()) detach("package:spacetime", unload=TRUE)
+if ("package:sp" %in% search()) detach("package:sp", unload=TRUE)
+if ("package:lattice" %in% search()) detach("package:lattice", unload=TRUE)
+if ("package:maps" %in% search()) detach("package:maps", unload=TRUE)
+
+cran_packages <- c("tidyselect", "tidyverse", "cluster", "ggdendro", "lubridate", "factoextra", 
+                   "ggpubr",  "corrplot", "BBmisc", "clValid", "ClustGeo",
+                   "gridExtra", "grid", "GGally", "ggforce", "gtools", "viridis")
+for (package in cran_packages) {
+  if(!require(package, character.only = TRUE)) install.packages(package, character.only = TRUE)
+  library(package, character.only = TRUE, quietly = TRUE)
+}
+
+rm(cran_packages)
+rm(package)
+```
+
+Load data from previous script
+```{r}
+load("../RData/3_Data_for_Clustering.RData")
+```
+
+Set default ggplot theme
+```{r}
+theme_set(theme_bw())
+theme_update(plot.title = element_text(hjust = 0.5))
+theme_update(plot.subtitle = element_text(hjust = 0.5))
+```
+
+# ClustGeo
+
+The clustering function in `ClustGeo` requires two matrices:
+- $D_0$: dissimilarities in the "feature space"
+- $D_1$: dissimilarities in the "constraint space"
+
+## Correlation distance
+
+#### Choice of number of clusters
+To choose the suitable number of clusters, we use hierarchical clustering considering only $D_0$ (feature dissimilarities) and look at the dendogramm.
+
+```{r}
+source("../Helpers/hclust_nclust.R")
+
+D0_results <- hclustgeo(D0 = as.dist(corr_matrix), 
+                        scale = TRUE, wt = NULL)
+hclust_nclust(hclust_result = D0_results,
+               feature_distance_matrix = corr_matrix,
+               spatial_distance_matrix = geodist_matrix,
+              colors = cividis(n = 2, end = 0.8))
+```
+
+The chosen number of clusters is 4. Here is the map of the clustering result.
+```{r}
+k_CG_corr <- 4
+ggplot(station_polygons) +
+  geom_sf(aes(fill=as.factor(cutree(D0_results, k = k_CG_corr))),
+          size = 0.3, alpha = 0.6) +
+  labs(title="Map of clusters from GeoClust",
+       subtitle = "using only feature dissimilarity",
+       fill="Region") +
+    scale_fill_manual(values = plasma(n = k_CG_corr)) +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+
+rm(D0_results)
+```
+
+## Choice of the mixing parameter
+The idea is to perform separate calculations for feature homogeneity and the geographic cohesion of the partitions obtained for a range of different values of $\alpha$ and the number of clusters previously selected.
+The practical solution is: conditioning on K and choosing $\alpha$ that best compromises between loss of feature and increase of geographical homogeneity.
+```{r}
+choice_of_mixing_param <- choicealpha(D0          = as.dist(corr_matrix),
+                                      D1          = as.dist(geodist_matrix),
+                                      range.alpha = seq(0, 1, 0.1),
+                                      K           = k_CG_corr,  # number of clusters
+                                      graph       = FALSE)
+```
+
+Plot of explained pseudo-inertias for different values of $\alpha$.
+```{r}
+plot_list <- list()
+plot_list[["Q"]] <- choice_of_mixing_param$Q %>%
+  as.data.frame() %>%
+  mutate(alpha = choice_of_mixing_param$range.alpha) %>%
+  pivot_longer(cols = c("Q0", "Q1"), values_to = "Q") %>%
+  ggplot(aes(x = alpha, y = Q, color = name)) +
+  geom_line() +
+  geom_point() +
+  scale_color_manual(values = c("black", "red"),
+                     labels = c("based on D0", "based on D1")) +
+  scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.2), limits = c(0, 1)) +
+  coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
+  theme_bw() +
+  labs(title = "Proportion of explained pseudo-inertias",
+       subtitle = "") +
+  theme(plot.title = element_text(hjust = 0.5, size = 11),
+        plot.subtitle = element_text(hjust = 0.5, size = 9),
+        axis.title = element_text(size = 9),
+        legend.title = element_blank())
+
+plot_list[["Qnorm"]] <- choice_of_mixing_param$Qnorm %>%
+  as.data.frame() %>%
+  mutate(alpha = choice_of_mixing_param$range.alpha) %>%
+  pivot_longer(cols = c("Q0norm", "Q1norm"), values_to = "Qnorm") %>%
+  ggplot(aes(x = alpha, y = Qnorm, color = name)) +
+  geom_line() +
+  geom_point() +
+  # annotate(geom = "text", x = 0, y = 1.25, size = 8,
+  #          label = paste0("of ", round(choice_of_mixing_param$Q[1,1]*100), "%")) +
+  scale_color_manual(values = c("black", "red"),
+                     labels = c("based on D0", "based on D1")) +
+  scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.2)) +
+  coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
+  theme_bw() +
+  labs(title = "Normal. prop. of explained pseudo-inertias",
+       subtitle = paste0("W/ D0 & alpha = 0: ",
+                         round(choice_of_mixing_param$Q[1,1]*100), "%; ",
+                         "W/ D1 & alpha = 1: ",
+                         round(choice_of_mixing_param$Q[length(choice_of_mixing_param$range.alpha),2]*100),
+                         "%")) +
+  theme(plot.title = element_text(hjust = 0.5, size = 11),
+        plot.subtitle = element_text(hjust = 0.5, size = 9),
+        axis.title = element_text(size = 9),
+        legend.title = element_blank())
+
+arranged_plot <- ggarrange(plotlist = plot_list, ncol = 2, nrow = 1, 
+                           common.legend = TRUE, legend = "bottom")
+
+annotate_figure(arranged_plot,
+                top = text_grob(
+                  paste0("Empirical choice of the mixing parameter for ", 
+                         k_CG_corr, " clusters"), size = 12))
+
+rm(plot_list)
+rm(arranged_plot)
+```
+
+Calculate the decrease/increase of pseudo-inertias with $\alpha$.
+```{r}
+as.data.frame(choice_of_mixing_param$Q) %>%
+  merge(as.data.frame(choice_of_mixing_param$Qnorm), by="row.names") %>%
+  rename(alpha = Row.names) %>%
+  mutate(Q0_diff = round(Q0norm - first(Q0norm), 4),
+         Q1_diff = round((Q1 - first(Q1))/first(Q1), 4))
+rm(choice_of_mixing_param)
+```
+
+
+### Clustering with geographical constraint
+After choosing the number of clusters k and the mixing parameter $\alpha$, one can finally cluster using also the spatial distance matrix.
+```{r}
+alpha_corr <- 0
+CG_corr_results <- hclustgeo(D0 = as.dist(corr_matrix),
+                        D1 = as.dist(geodist_matrix),
+                        alpha = alpha_corr,
+                        scale = TRUE, wt = NULL)
+
+# Map of clustering result
+ggplot(station_polygons) +
+  geom_sf(aes(fill=as.factor(cutree(CG_corr_results, k = k_CG_corr))),
+          size = 0.3, alpha = 0.6) +
+      scale_fill_manual(values = plasma(n = k_CG_corr)) +
+  labs(title="Map of clusters from GeoClust with correlation distance",
+       subtitle = paste0("alpha = ", alpha_corr, " from choice using k = ", k_CG_corr),
+       fill="Region") +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+## Euclidean distance
+
+#### Choice of number of clusters
+To choose the suitable number of clusters, we use hierarchical clustering considering only $D_0$ (feature dissimilarities) and look at the dendogramm.
+
+```{r}
+D0_results <- hclustgeo(D0 = eucl_matrix_dist, 
+                        scale = TRUE, wt = NULL)
+hclust_nclust(hclust_result = D0_results,
+               feature_distance_matrix = as.matrix(eucl_matrix_dist),
+               spatial_distance_matrix = geodist_matrix,
+              colors = cividis(n = 2, end = 0.8))
+```
+
+There is no consensus across all method for the number of clusters. We will use 4 since it is a middle ground.
+```{r}
+k_CG_eucl <- 4
+ggplot(station_polygons) +
+  geom_sf(aes(fill=as.factor(cutree(D0_results, k = k_CG_eucl)))) +
+  labs(title="Map of clusters from GeoClust",
+       subtitle = "using only feature dissimilarity",
+       fill="Region") +
+  scale_fill_manual(values = plasma(n = k_CG_eucl)) +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+
+rm(D0_results)
+```
+
+## Choice of the mixing parameter
+The idea is to perform separate calculations for feature homogeneity and the geographic cohesion of the partitions obtained for a range of different values of $\alpha$ and the number of clusters previously selected.
+The practical solution is: conditioning on K and choosing $\alpha$ that best compromises between loss of socio-economic and loss of geographical homogeneity.
+```{r}
+choice_of_mixing_param <- choicealpha(D0          = eucl_matrix_dist,
+                                      D1          = as.dist(geodist_matrix),
+                                      range.alpha = seq(0, 1, 0.1),
+                                      K           = k_CG_eucl,  # number of clusters
+                                      graph       = FALSE)
+```
+
+Plot of explained pseudo-inertias for different values of $\alpha$.
+```{r}
+plot_list <- list()
+plot_list[["Q"]] <- choice_of_mixing_param$Q %>%
+  as.data.frame() %>%
+  mutate(alpha = choice_of_mixing_param$range.alpha) %>%
+  pivot_longer(cols = c("Q0", "Q1"), values_to = "Q") %>%
+  ggplot(aes(x = alpha, y = Q, color = name)) +
+  geom_line() +
+  geom_point() +
+  scale_color_manual(values = c("black", "red"),
+                     labels = c("based on D0", "based on D1")) +
+  scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.2), limits = c(0, 1)) +
+  coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
+  theme_bw() +
+  labs(title = "Proportion of explained pseudo-inertias",
+       subtitle = "") +
+  theme(plot.title = element_text(hjust = 0.5, size = 11),
+        plot.subtitle = element_text(hjust = 0.5, size = 9),
+        axis.title = element_text(size = 9),
+        legend.title = element_blank())
+
+plot_list[["Qnorm"]] <- choice_of_mixing_param$Qnorm %>%
+  as.data.frame() %>%
+  mutate(alpha = choice_of_mixing_param$range.alpha) %>%
+  pivot_longer(cols = c("Q0norm", "Q1norm"), values_to = "Qnorm") %>%
+  ggplot(aes(x = alpha, y = Qnorm, color = name)) +
+  geom_line() +
+  geom_point() +
+  # annotate(geom = "text", x = 0, y = 1.25, size = 8,
+  #          label = paste0("of ", round(choice_of_mixing_param$Q[1,1]*100), "%")) +
+  scale_color_manual(values = c("black", "red"),
+                     labels = c("based on D0", "based on D1")) +
+  scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.2)) +
+  coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
+  theme_bw() +
+  labs(title = "Normal. prop. of explained pseudo-inertias",
+       subtitle = paste0("W/ D0 & alpha = 0: ",
+                         round(choice_of_mixing_param$Q[1,1]*100), "%; ",
+                         "W/ D1 & alpha = 1: ",
+                         round(choice_of_mixing_param$Q[length(choice_of_mixing_param$range.alpha),2]*100),
+                         "%")) +
+  theme(plot.title = element_text(hjust = 0.5, size = 11),
+        plot.subtitle = element_text(hjust = 0.5, size = 9),
+        axis.title = element_text(size = 9),
+        legend.title = element_blank())
+
+arranged_plot <- ggarrange(plotlist = plot_list, ncol = 2, nrow = 1, 
+                           common.legend = TRUE, legend = "bottom")
+
+annotate_figure(arranged_plot,
+                top = text_grob(
+                  paste0("Empirical choice of the mixing parameter for ", 
+                         k_CG_eucl, " clusters"), size = 12))
+
+rm(plot_list)
+rm(arranged_plot)
+```
+
+Calculate the decrease/increase of pseudo-inertias with alpha.
+```{r}
+as.data.frame(choice_of_mixing_param$Q) %>%
+  merge(as.data.frame(choice_of_mixing_param$Qnorm), by="row.names") %>%
+  rename(alpha = Row.names) %>%
+  mutate(Q0_diff = round(Q0norm - first(Q0norm), 4),
+         Q1_diff = round((Q1 - first(Q1))/first(Q1), 4))
+rm(choice_of_mixing_param)
+```
+
+
+### Clustering with geographical constraint
+```{r}
+alpha_eucl = 0.4
+CG_eucl_results <- hclustgeo(D0 = eucl_matrix_dist,
+                        D1 = as.dist(geodist_matrix),
+                        alpha = alpha_eucl,
+                        scale = TRUE, wt = NULL)
+ggdendrogram(CG_eucl_results, rotate = FALSE, size = 2) +
+  labs(title = "Dendogramm from GeoClust",
+       subtitle = paste0("alpha = ", alpha_eucl, " from choice using k = ", k_CG_eucl)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+
+ggplot(station_polygons) +
+  geom_sf(aes(fill=as.factor(cutree(CG_eucl_results, k = k_CG_eucl))),
+          size = 0.3, alpha = 0.6) +
+  labs(title="Map of clusters from GeoClust with Euclidean distance",
+       subtitle = paste0("alpha = ", alpha_eucl, " from choice using k = ", k_CG_eucl),
+       fill="Region") +
+    scale_fill_manual(values = plasma(n = k_CG_eucl)) +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+## DTW distance
+
+#### Choice of number of clusters
+To choose the suitable number of clusters, we use hierarchical clustering considering only $D_0$ (feature dissimilarities) and look at the dendogramm.
+
+```{r}
+D0_results <- hclustgeo(D0 = as.dist(dtw_matrix_dist), 
+                        scale = TRUE, wt = NULL)
+hclust_nclust(hclust_result = D0_results,
+               feature_distance_matrix = as.matrix(dtw_matrix_dist),
+               spatial_distance_matrix = geodist_matrix,
+              colors = cividis(n = 2, end = 0.8))
+```
+
+There is no consensus across all method for the number of clusters. We will use 4 since it is a middle ground.
+```{r}
+k_CG_dtw = 4
+ggplot(station_polygons) +
+  geom_sf(aes(fill=as.factor(cutree(D0_results, k = k_CG_dtw))), size = 0.5) +
+  labs(title="Map of clusters from GeoClust",
+       subtitle = "using only feature dissimilarity",
+       fill="cluster") +
+  scale_fill_manual(values = plasma(n = k_CG_dtw)) +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+       
+rm(D0_results)
+```
+
+## Choice of the mixing parameter
+The idea is to perform separate calculations for feature homogeneity and the geographic cohesion of the partitions obtained for a range of different values of $\alpha$ and the number of clusters previously selected.
+The practical solution is: conditioning on K and choosing $\alpha$ that best compromises between loss of socio-economic and loss of geographical homogeneity.
+```{r}
+choice_of_mixing_param <- choicealpha(D0          = as.dist(dtw_matrix_dist),
+                                      D1          = as.dist(geodist_matrix),
+                                      range.alpha = seq(0, 1, 0.1),
+                                      K           = k_CG_dtw,  # number of clusters
+                                      graph       = FALSE)
+```
+
+
+```{r}
+plot_list <- list()
+plot_list[["Q"]] <- choice_of_mixing_param$Q %>%
+  as.data.frame() %>%
+  mutate(alpha = choice_of_mixing_param$range.alpha) %>%
+  pivot_longer(cols = c("Q0", "Q1"), values_to = "Q") %>%
+  ggplot(aes(x = alpha, y = Q, color = name)) +
+  geom_line() +
+  geom_point() +
+  scale_color_manual(values = c("black", "red"),
+                     labels = c("based on D0", "based on D1")) +
+  scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.2), limits = c(0, 1)) +
+  coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
+  theme_bw() +
+  labs(title = "Proportion of explained pseudo-inertias",
+       subtitle = "") +
+  theme(plot.title = element_text(hjust = 0.5, size = 11),
+        plot.subtitle = element_text(hjust = 0.5, size = 9),
+        axis.title = element_text(size = 9),
+        legend.title = element_blank())
+
+plot_list[["Qnorm"]] <- choice_of_mixing_param$Qnorm %>%
+  as.data.frame() %>%
+  mutate(alpha = choice_of_mixing_param$range.alpha) %>%
+  pivot_longer(cols = c("Q0norm", "Q1norm"), values_to = "Qnorm") %>%
+  ggplot(aes(x = alpha, y = Qnorm, color = name)) +
+  geom_line() +
+  geom_point() +
+  scale_color_manual(values = c("black", "red"),
+                     labels = c("based on D0", "based on D1")) +
+  scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.2)) +
+  coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
+  theme_bw() +
+  labs(title = "Normal. prop. of explained pseudo-inertias",
+       subtitle = paste0("W/ D0 & alpha = 0: ",
+                         round(choice_of_mixing_param$Q[1,1]*100), "%; ",
+                         "W/ D1 & alpha = 1: ",
+                         round(choice_of_mixing_param$Q[length(choice_of_mixing_param$range.alpha),2]*100),
+                         "%")) +
+  theme(plot.title = element_text(hjust = 0.5, size = 11),
+        plot.subtitle = element_text(hjust = 0.5, size = 9),
+        axis.title = element_text(size = 9),
+        legend.title = element_blank())
+
+arranged_plot <- ggarrange(plotlist = plot_list, ncol = 2, nrow = 1, 
+                           common.legend = TRUE, legend = "bottom")
+
+annotate_figure(arranged_plot,
+                top = text_grob(
+                  paste0("Empirical choice of the mixing parameter for ", 
+                         k_CG_dtw, " clusters"), size = 12))
+
+rm(plot_list)
+rm(arranged_plot)
+```
+
+Calculate the decrease/increase of pseudo-inertias with alpha.
+```{r}
+as.data.frame(choice_of_mixing_param$Q) %>%
+  merge(as.data.frame(choice_of_mixing_param$Qnorm), by="row.names") %>%
+  rename(alpha = Row.names) %>%
+  mutate(Q0_diff = round(Q0norm - first(Q0norm), 4),
+         Q1_diff = round((Q1 - first(Q1))/first(Q1), 4))
+rm(choice_of_mixing_param)
+```
+
+
+### Clustering with geographical constraint
+```{r}
+alpha_dtw <- 0.2
+CG_dtw_results <- hclustgeo(D0 = as.dist(dtw_matrix_dist),
+                        D1 = as.dist(geodist_matrix),
+                        alpha = alpha_dtw,
+                        scale = TRUE, wt = NULL)
+ggdendrogram(CG_dtw_results, rotate = FALSE, size = 2) +
+  labs(title = "Dendogramm from GeoClust",
+       subtitle = paste0("alpha = ", alpha_dtw, " from choice using k = ", k_CG_dtw)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+
+ggplot(station_polygons) +
+  geom_sf(aes(fill=as.factor(cutree(CG_dtw_results, k = k_CG_dtw))), 
+          size = 0.3, alpha = 0.6) +
+  labs(title="Map of clusters from GeoClust with DTW distance",
+       subtitle = paste0("alpha = ", alpha_dtw, " from choice using k = ", k_CG_dtw),
+       fill="Region") +
+  scale_fill_manual(values = plasma(n = k_CG_dtw)) +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+```{r}
+rm(list = str_subset(string = str_subset(string = str_subset(string = ls(), 
+                                                             pattern = "^alpha", negate = TRUE), 
+                                         pattern = "results$", negate = TRUE), 
+                     pattern = "^k_", negate = TRUE))
+save.image("../RData/5_ClustGeo_results.RData")
+```

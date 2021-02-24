@@ -1,0 +1,122 @@
+---
+title: "3.6: Comparison of Clustering Methods"
+author: "Silvia Ventoruzzo"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Import packages
+```{r}
+# Detach the following packages and ClustGeo
+if ("package:raster" %in% search()) detach("package:raster", unload=TRUE)
+if ("package:spacetime" %in% search()) detach("package:spacetime", unload=TRUE)
+if ("package:sp" %in% search()) detach("package:sp", unload=TRUE)
+if ("package:lattice" %in% search()) detach("package:lattice", unload=TRUE)
+if ("package:maps" %in% search()) detach("package:maps", unload=TRUE)
+
+cran_packages <- c("tidyselect", "tidyverse", "cluster", "ggdendro", "lubridate", "factoextra", 
+                   "ggpubr",  "corrplot", "BBmisc", "clValid", "ClustGeo",
+                   "gridExtra", "grid", "GGally", "ggforce", "gtools", "viridis")
+for (package in cran_packages) {
+  if(!require(package, character.only = TRUE)) install.packages(package, character.only = TRUE)
+  library(package, character.only = TRUE, quietly = TRUE)
+}
+
+rm(cran_packages)
+rm(package)
+```
+
+Load data from previous script
+```{r}
+load("../RData/3_Data_for_Clustering.RData")
+load("../RData/4_HiClimR_results.RData")
+load("../RData/5_ClustGeo_results.RData")
+load("../RData/6_Bootstrap_ClustGeo_results.RData")
+load("../RData/7_CorClustST_results.RData")
+```
+
+Set default ggplot theme
+```{r}
+theme_set(theme_bw())
+theme_update(plot.title = element_text(hjust = 0.5))
+theme_update(plot.subtitle = element_text(hjust = 0.5))
+```
+
+## Comparison of clustering results
+
+### Internal validation statistics
+Dunn index: should be maximized
+Average distance within clusters: should be minimized
+Average silhouette width: should be maximized
+Connectivity: should be minimized
+```{r}
+source("../Helpers/spatialcluster_comparison.R")
+
+corr_comparisons <- spatialcluster_comparison(
+  labels_list = list(HiClimR_regional_daily = cutree(HiClimR_regional_results, k = k_HclimR_reg),
+                     HiClimR_average_daily  = cutree(HiClimR_average_results, k = k_HclimR_avg),
+                     CorClustST = CorClustST_results$clusters$label),
+  feature_distance_matrix = corr_matrix, 
+  spatial_distance_matrix = geodist_matrix,
+  stats = c("dunn", "average.within", 
+            "avg.silwidth",
+            "connectivity"))
+
+corr_weekly_comparisons <- spatialcluster_comparison(
+  labels_list = list(HiClimR_regional_weekly = cutree(HiClimR_regional_weekly_results, k = k_HclimR_week_reg),
+                     HiClimR_average_weekly = cutree(HiClimR_average_weekly_results, k = k_HclimR_week_avg)),
+  feature_distance_matrix = corr_weekly_matrix, 
+  spatial_distance_matrix = geodist_matrix,
+  stats = c("dunn", "average.within", 
+            "avg.silwidth",
+            "connectivity"))
+
+eucl_comparisons <- spatialcluster_comparison(
+  labels_list = list(CG_euclidean = cutree(CG_eucl_results, k = k_CG_eucl),
+                     BCG  = cutree(BCG_results, k = k_CG_eucl)),
+  feature_distance_matrix = as.matrix(eucl_matrix_dist), 
+  spatial_distance_matrix = geodist_matrix,
+  stats = c("dunn", "average.within", 
+            "avg.silwidth",
+            "connectivity"))
+
+bind_rows(list(corr_comparisons$validation_statistics,
+               eucl_comparisons$validation_statistics,
+               corr_weekly_comparisons$validation_statistics)) %>%
+  arrange(distance, cluster_method)
+
+rm(list=lsf.str())
+```
+
+According to the internal validation techniques above, the best performing methods is ClustGeo (with Euclidean distance).
+
+```{r}
+# Assignment of cluster info
+station_data <- station_data %>%
+  mutate(cluster = cutree(CG_eucl_results, k = k_CG_eucl))
+station_points <- station_points %>%
+  mutate(cluster = cutree(CG_eucl_results, k = k_CG_eucl))
+station_polygons <- station_polygons %>%
+  mutate(cluster = cutree(CG_eucl_results, k = k_CG_eucl))
+weather_data <- weather_data %>%
+  left_join(station_data[c("station_id", "cluster")], by = "station_id")
+weather_data_num <- weather_data_num %>%
+  left_join(station_data[c("station_id", "cluster")], by = "station_id")
+weather_data_norm <- weather_data_norm %>%
+  left_join(station_data[c("station_id", "cluster")], by = "station_id")
+```
+
+
+```{r}
+rm(list = str_subset(string = str_subset(string = str_subset(string = setdiff(ls(), 
+                                                                              c("postal_codes_nn",
+                                                                              "federal_state_polygons",
+                                                                              "postal_code_polygons")), 
+                                                             pattern = "^.*variables.*$", negate = TRUE), 
+                                         pattern = "^weather", negate = TRUE), 
+                     pattern = "^station", negate = TRUE))
+save.image("../RData/8_Cluster_Methods_comparison.RData")
+```

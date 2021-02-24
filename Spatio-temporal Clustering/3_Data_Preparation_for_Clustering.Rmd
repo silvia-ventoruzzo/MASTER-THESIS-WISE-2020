@@ -1,0 +1,372 @@
+---
+title: "3.1: Data preparation for Spatial Clustering"
+author: "Silvia Ventoruzzo"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Import packages
+```{r}
+cran_packages <- c("tidyselect", "tidyverse", "sf", "lwgeom", "nngeo", "fastDummies",
+                   "HiClimR", "cluster", "ggdendro", "lubridate", "parallelDist",
+                   "dtw", "factoextra", "ggpubr",  "corrplot", "BBmisc", "tseries",
+                   "dtwclust", "clValid", 
+                   "gridExtra", "grid", "GGally", "ggforce", "gtools", "viridis")
+for (package in cran_packages) {
+  if(!require(package, character.only = TRUE)) install.packages(package, character.only = TRUE)
+  library(package, character.only = TRUE, quietly = TRUE)
+}
+
+rm(cran_packages)
+rm(package)
+```
+
+Load data from previous script
+```{r}
+load("../RData/2_Geo_Data.RData")
+```
+
+Set default ggplot theme
+```{r}
+theme_set(theme_bw())
+theme_update(plot.title = element_text(hjust = 0.5))
+theme_update(plot.subtitle = element_text(hjust = 0.5))
+```
+
+# Regionalization
+There is no generally optimal regionalization technique, but this needs to be carefully selected because it is crucial in identifying particular patterns.
+
+Different clustering methods will be tested against each other using classical internal validation statistics. The used methods are the following:
+* HiClimR + regional linkage
+* HiClimR + average linkage + ContigConst
+* ClustGeo
+* Bootstrap ClustGeo
+* CorClustST
+
+HiClimR may give different results depending if data is daily detrended or weekly, therefore both cases will be analyzed. 
+Moreover, ClustGeo works directly with a distance matrix, therefore different distance measures (Euclidean, DTW and correlation) will be used. 
+Bootstrap ClustGeo calculates the distance for each repetition and it's computationally expensive, therefore only the distance measure which performed best with ClustGeo will be used. 
+Finally, CorClustST uses the correlation distance (as default Pearson correlation), this will be kept.
+
+## Combination of precipitation_type and precipitation_mm
+To decompose time series and calculate time series distances we need numeric variables. Since the variable `precipitation_type` is categorical, we will combine this with `precipitation_mm` where the new variables, e.g. `precipitation_mm_rain` will have a positive value if `precipitation_type` = "rain", otherwise 0.
+
+Create dummies out of `precipitation_type` (except for level "none")
+```{r}
+weather_data_num <- weather_data %>%
+  dplyr::select(station_id, measurement_date, all_of(variables_of_interest)) %>%
+  dummy_cols(select_columns = "precipitation_type") %>%
+  mutate_at(vars(starts_with("precipitation_type_")), ~.x*precipitation_mm) %>%
+  dplyr::select(-precipitation_mm, -precipitation_type,-precipitation_type_none) %>%
+  rename_at(vars(starts_with("precipitation_type_")), ~gsub("type", "mm", .x))
+numeric_variables <- weather_data_num %>%
+  select_if(is.numeric) %>%
+  colnames()
+head(weather_data_num)
+```
+
+## Pre-processing
+The preprocessing steps need to be selected according to the purpose of the clustering process. Therefore data was not detrended or deseasonalized to let the clusters "capture this behavior instead". An exception is the preprocessing for `HiClimR`, where on the one side daily data is detrended and on the other it is aggregated at the weekly level. Lastly, data is scaled using normalization because it allows the clustering methods to capture time series of similar shapes instead of similar variances.
+
+Therefore we have 3 different types of preprocessing:
+  \item daily + normalized
+  \item weekly + normalized
+  \item daily + detrended/deseasonalized + normalized
+  
+### Weekly data
+```{r}
+weather_data_weekly <- weather_data_num %>%
+  group_by(station_id, 
+           week = paste0(year(measurement_date), "-", str_pad(week(measurement_date), 2, pad = "0"))) %>%
+  summarize_if(is.numeric, mean) %>%
+  ungroup() 
+# List of matrices with weekly values
+weather_weekly_matrix_list <- sapply(numeric_variables,
+                                     function(i) {
+                                       weather_data_weekly %>%
+                                         pivot_wider(id_cols = "station_id", 
+                                                     names_from = "week", 
+                                                     values_from = all_of(i)) %>%
+                                         dplyr::select(-station_id) %>%
+                                         as.matrix()
+                                       },
+                                     simplify = FALSE, USE.NAMES = TRUE)
+```
+
+
+### Detrending and deseasonalizing
+
+```{r}
+# Indicate starting date of time series
+start_date <- min(weather_data_num$measurement_date)
+start_date <- c(year(start_date), month(start_date), day(start_date))
+# Create empty object
+ts_decomposed <- list()
+
+numeric_variables <- colnames(weather_data_num)[sapply(weather_data_num, is.numeric)]
+
+for (id in unique(weather_data_num$station_id)) {
+  
+  for (var in numeric_variables) {
+    
+    # Create name for the specific combination
+    name_spec <- paste(id, var, sep=";")
+    
+    # Create time series for specific combination of weather station and variable
+    ts_spec <- weather_data_num %>% 
+      filter(station_id == id) %>% 
+      dplyr::select(!!var) %>%
+      ts(start = start_date,
+         frequency = 365+1* (!start_date[1]%%400 || ((start_date[1]%%100)&&!start_date[1]%%4)))
+    
+    # Calculate decomposition of time series for specific combination of weather station and variable
+    ts_decomposed_spec <- decompose(ts_spec, type="additive")
+    # print(plot(ts_decomposed_spec))
+    # Add station_id and variable name to elements of decomposed time series
+    names(ts_decomposed_spec) <- sapply(names(ts_decomposed_spec), function(x) paste(name_spec, x, sep="."))
+
+    # Add named element to the vectors
+    ts_decomposed <- c(ts_decomposed, ts_decomposed_spec)
+    
+  }
+  
+}
+
+rm(id)
+rm(var)
+rm(start_date)
+rm(name_spec)
+rm(ts_spec)
+rm(ts_decomposed_spec)
+```
+
+Extract random part, i.e. stationary series.
+```{r, warning = FALSE}
+# Extract all list elements which have the word "random" after the "."
+ts_random <- ts_decomposed[str_subset(names(ts_decomposed), "random$")]
+
+# Create empty list to fill with weather matrices
+weather_matrix_list <- list()
+
+for (var in numeric_variables) {
+  
+  # Extract all list elements from a specific weather variable
+  ts_var <- ts_random[str_subset(names(ts_random), 
+                                 paste0("^\\d{5};", var, ".random$"))]
+  
+  
+  # Create a NxM matrix out of the elements in the list
+  var_matrix <- sapply(ts_var, function(x) as.numeric(x))
+  # var_matrix <- do.call(cbind, ts_var)
+  var_matrix <- t(var_matrix)
+  
+  # Fix row names (station_id) and column names (dates)
+  rownames(var_matrix) <- str_extract(rownames(var_matrix), "[0-9]+")
+  colnames(var_matrix) <- unique(as.Date(weather_data$measurement_date))
+  
+  # Remove columns with missing values
+  var_matrix <- var_matrix[,colSums(is.na(var_matrix)) == 0] 
+  
+  # Add matrix to the list
+  #weather_matrix_list <- list(weather_matrix_list, var_matrix)
+  weather_matrix_list[[var]] <- var_matrix
+}
+
+# Dataframe with deseasonalized and detrended time series
+weather_data_detrended <- lapply(names(weather_matrix_list),
+                                 function(v) {
+                                   as_tibble(weather_matrix_list[[v]]) %>%
+  mutate(station_id = rownames(var_matrix)) %>%
+  pivot_longer(cols = c(everything(), -station_id),
+               names_to = "measurement_date",
+               values_to = v) %>%
+  mutate(measurement_date = as.Date(as.numeric(measurement_date), origin = "1970-01-01"))
+                                 }) %>%
+  purrr::reduce(.f = full_join, by = c("station_id", "measurement_date"))
+
+rm(ts_random)
+rm(var)
+rm(ts_var)
+rm(var_matrix)
+```
+
+### Normalization
+Since the weather variables have different scales, we need to scale them.
+```{r}
+# Normalize daily data
+weather_data_norm <- weather_data_num %>% 
+  group_by(station_id) %>%
+  mutate_if(is.numeric, BBmisc::normalize, method = "range") %>%
+  ungroup()
+# Normalize detrended daily data
+weather_data_detrended_norm <- weather_data_detrended %>%
+  group_by(station_id) %>%
+  mutate_if(is.numeric, BBmisc::normalize, method = "range") %>%
+  ungroup()
+weather_matrix_list <- lapply(weather_matrix_list,
+                              function(x) {
+                                t(apply(x, 1, BBmisc::normalize, method = "range"))
+                              })
+# Normalize weekly data
+weather_data_weekly_norm <- weather_data_weekly %>%
+  group_by(station_id) %>%
+  mutate_if(is.numeric, BBmisc::normalize, method = "range") %>%
+  ungroup()
+weather_weekly_matrix_list <- lapply(weather_weekly_matrix_list,
+                              function(x) {
+                                t(apply(x, 1, BBmisc::normalize, method = "range"))
+                              })
+```
+
+## Correlation and principal components
+
+Correlation
+```{r}
+ggcorr(data = select_if(weather_data_num, is.numeric),
+       size = 3)
+corrplot(corr = cor(select_if(weather_data_num, is.numeric)), 
+         type = "lower", order="original",
+         tl.col = "black", tl.srt = 45,
+         col = colorRampPalette(rev(c("#67001F", "#B2182B", "#D6604D", "#F4A582", "#FDDBC7",
+                                      "#FFFFFF", "#D1E5F0", "#92C5DE", "#4393C3", "#2166AC", "#053061")))(200))
+```
+
+Principal components
+```{r}
+pca <- stats::prcomp(select_if(weather_data_norm, is.numeric))
+pca_plot <- fviz_pca_var(X = pca, 
+             col.var = "contrib",
+             # col.circle = "grey",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             ggtheme = theme_bw()) 
+
+pca_plot +
+  labs(color = "contributions") +
+  ggplot2::xlim(min(c(pca_plot$data$x-0.5, pca_plot$data$y-0.5)),
+                max(c(pca_plot$data$x+0.5, pca_plot$data$y+0.5))) +
+  ggplot2::ylim(min(c(pca_plot$data$x-0.5, pca_plot$data$y-0.5)),
+                max(c(pca_plot$data$x+0.5, pca_plot$data$y+0.5))) +
+  geom_circle(aes(x0 = 0, y0 = 0, r = 1)) +
+  coord_fixed()
+
+fviz_screeplot(X = pca,
+               ggtheme = theme_bw())
+
+get_eigenvalue(X = pca) %>%
+  rownames_to_column(var = "pc") %>%
+  mutate(pc = gsub("Dim.", "", pc)) %>%
+  ggplot(aes(x = reorder(pc, sort(as.numeric(pc))), 
+             y = cumulative.variance.percent)) +
+  geom_bar(stat = "identity", fill = "steelblue", color = "steelblue") +
+  labs(x = "Dimensions", 
+       y = "Cumulative percentage of explained variance")
+
+pca_results <- get_pca(res.pca = pca)
+pca_results$contrib %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "variable")
+pca_results$coord %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "variable")
+
+rm(pca)
+rm(pca_results)
+rm(pca_plot)
+```
+
+
+## Distance matrices
+
+The correlation distance will be calculated from the Weather Index, since we need a univariate time series and this captures the combination of the weather variables. However, we need to check if it is stationary.
+```{r, warning=FALSE}
+adf_test_results <- sapply(station_data$station_id,
+                           function(i) {
+                             adf.test(x = weather_data$weather_index[weather_data$station_id == i])$p.value
+                           })
+
+adf_test_results
+
+rm(adf_test_results)
+```
+
+
+### Feature distances
+\item Euclidean distance
+\item DTW distance
+\item Correlation distance: this will be calculated using the weather index, because we can only do it with a univariate time series
+```{r}
+# Stations
+station_ids <- unique(station_data$station_id)
+station_grid <- combinations(n = length(unique(station_data$station_id)), r = 2, 
+                             v = unique(station_data$station_id),
+                             repeats.allowed = TRUE)
+
+# Prepare list of dataframes for calculation of distances
+weather_by_station <- sapply(station_ids,
+       function(i) {
+         weather_data_norm %>%
+           filter(station_id == i) %>%
+           pivot_longer(cols = all_of(numeric_variables), names_to = "variable") %>%
+           pivot_wider(names_from = "measurement_date", 
+                       values_from = "value") %>%
+           dplyr::select(-station_id, -variable) %>%
+           as.matrix()
+         },
+       simplify = FALSE, USE.NAMES = TRUE)
+
+# Distance of daily data
+start_time <- Sys.time()
+dtw_matrix_dist <- proxy::dist(x = weather_by_station, 
+                               method = "dtw_basic", 
+                               step.pattern = dtw::symmetric2,
+                               norm = "L2",
+                               sqrt.dist = FALSE,
+                               normalize = TRUE,
+                               window.type = "sakoechiba",
+                               window.size = 6)
+eucl_matrix_dist <- parDist(x = weather_by_station,
+                            method = "euclidean")
+corr_matrix <- cor(x = weather_data %>%
+                     pivot_wider(id_cols = "measurement_date",
+                                 names_from = "station_id",
+                                 values_from = "weather_index") %>%
+                     dplyr::select(-measurement_date))
+corr_matrix <- 1 - corr_matrix # to transform it into distance measure
+end_time <- Sys.time()
+end_time - start_time
+
+# Distance of weekly data
+corr_weekly_matrix <- cor(x = weather_data %>%
+                            group_by(station_id,
+                                     week = paste0(year(measurement_date), "-", 
+                                                   str_pad(week(measurement_date), 2, pad = "0"))) %>%
+                            summarize(weather_index = mean(weather_index)) %>%
+                            ungroup() %>%
+                            pivot_wider(id_cols = "week", 
+                                        names_from = "station_id",
+                                        values_from = "weather_index") %>%
+                            dplyr::select(-week))
+corr_weekly_matrix <- 1 - corr_weekly_matrix # to transform it into distance measure
+
+rm(start_time)
+rm(end_time)
+rm(station_grid)
+rm(weather_by_station)
+```
+
+### Spatial distances
+```{r}
+geodist_matrix <- st_distance(x = station_points, 
+                              y = station_points, 
+                              by_element = FALSE)
+rownames(geodist_matrix) <- station_ids
+colnames(geodist_matrix) <- station_ids
+```
+
+```{r}
+save.image("../RData/3_Data_for_Clustering.RData")
+```
+
